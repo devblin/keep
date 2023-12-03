@@ -2,8 +2,9 @@ import json
 import logging
 import time
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
+import sqlalchemy
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlmodel import Session, select
@@ -15,6 +16,7 @@ from keep.api.core.dependencies import (
     get_user_email,
     verify_api_key,
     verify_bearer_token,
+    verify_token_or_key,
 )
 from keep.api.models.db.provider import Provider
 from keep.api.models.webhook import ProviderWebhookSettings
@@ -22,7 +24,10 @@ from keep.api.utils.tenant_utils import get_or_create_api_key
 from keep.contextmanager.contextmanager import ContextManager
 from keep.event_subscriber.event_subscriber import EventSubscriber
 from keep.providers.base.base_provider import BaseProvider
-from keep.providers.base.provider_exceptions import GetAlertException
+from keep.providers.base.provider_exceptions import (
+    GetAlertException,
+    ProviderMethodException,
+)
 from keep.providers.providers_factory import ProvidersFactory
 from keep.secretmanager.secretmanagerfactory import SecretManagerFactory
 
@@ -30,11 +35,31 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _is_localhost():
+    # TODO - there are more "advanced" cases that we don't catch here
+    #        e.g. IP's that are not public but not localhost
+    #        the more robust way is to try access KEEP_API_URL from another tool (such as wtfismy.com but the opposite)
+    #
+    #        this is a temporary solution until we have a better one
+    api_url = config("KEEP_API_URL")
+    if "localhost" in api_url:
+        return True
+
+    if "127.0.0" in api_url:
+        return True
+
+    # default on localhost if no USE_NGROK
+    if "0.0.0.0" in api_url:
+        return True
+
+    return False
+
+
 @router.get(
     "",
 )
 def get_providers(
-    tenant_id: str = Depends(verify_bearer_token),
+    tenant_id: str = Depends(verify_token_or_key),
 ):
     logger.info("Getting installed providers", extra={"tenant_id": tenant_id})
     providers = ProvidersFactory.get_all_providers()
@@ -42,14 +67,21 @@ def get_providers(
         tenant_id, providers, include_details=True
     )
 
+    is_localhost = _is_localhost()
+
     try:
         return {
             "providers": providers,
             "installed_providers": installed_providers,
+            "is_localhost": is_localhost,
         }
     except Exception:
         logger.exception("Failed to get providers")
-        return {"providers": providers, "installed_providers": []}
+        return {
+            "providers": providers,
+            "installed_providers": [],
+            "is_localhost": is_localhost,
+        }
 
 
 @router.get(
@@ -220,7 +252,7 @@ def test_provider(
 def delete_provider(
     provider_type: str,
     provider_id: str,
-    tenant_id: str = Depends(verify_bearer_token),
+    tenant_id: str = Depends(verify_token_or_key),
     session: Session = Depends(get_session),
 ):
     logger.info(
@@ -242,13 +274,15 @@ def delete_provider(
             secret_manager.delete_secret(provider.configuration_key)
         # in case the secret does not deleted, just log it but still
         # delete the provider so
-        except Exception as exc:
+        except Exception:
             logger.exception("Failed to delete the provider secret")
             pass
         # delete the provider anyway
         session.delete(provider)
         session.commit()
-    except Exception as exc:
+    except sqlalchemy.orm.exc.NoResultFound:
+        raise HTTPException(404, detail="Provider not found")
+    except Exception:
         # TODO: handle it better
         logger.exception("Failed to delete the provider secret")
         pass
@@ -258,7 +292,7 @@ def delete_provider(
         try:
             event_subscriber = EventSubscriber.get_instance()
             event_subscriber.remove_consumer(provider)
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to unregister provider as a consumer")
             # return 200 as the next time Keep will start, it will try to unregister again
     logger.info("Deleted provider", extra={"provider_id": provider_id})
@@ -276,7 +310,7 @@ def validate_scopes(
             for scope in provider.PROVIDER_SCOPES:
                 if scope.mandatory and (
                     scope.name not in validated_scopes
-                    or validated_scopes[scope.name] != True
+                    or validated_scopes[scope.name] is not True
                 ):
                     mandatory_scopes_validated = False
                     break
@@ -398,7 +432,7 @@ async def update_provider(
 @router.post("/install")
 async def install_provider(
     request: Request,
-    tenant_id: str = Depends(verify_bearer_token),
+    tenant_id: str = Depends(verify_token_or_key),
     session: Session = Depends(get_session),
     installed_by: str = Depends(get_user_email),
 ):
@@ -414,9 +448,14 @@ async def install_provider(
         raise HTTPException(status_code=400, detail="No valid data provided")
 
     # Extract parameters from the provider_info dictionary
-    provider_id = provider_info.pop("provider_id")
-    provider_name = provider_info.pop("provider_name")
-    provider_type = provider_info.pop("provider_type", None) or provider_id
+    try:
+        provider_id = provider_info.pop("provider_id")
+        provider_name = provider_info.pop("provider_name")
+        provider_type = provider_info.pop("provider_type", None) or provider_id
+    except KeyError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Missing required field: {e.args[0]}"
+        )
 
     provider_unique_id = uuid.uuid4().hex
     logger.info(
@@ -480,7 +519,7 @@ async def install_provider(
         try:
             event_subscriber = EventSubscriber.get_instance()
             event_subscriber.add_consumer(provider)
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to register provider as a consumer")
             # return 200 as the next time Keep will start, it will try to register again
 
@@ -558,6 +597,59 @@ async def install_provider_oauth2(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post(
+    "/{provider_id}/invoke/{method}",
+    description="Invoke provider special method",
+    status_code=200,
+)
+def invoke_provider_method(
+    provider_id: str,
+    method: str,
+    method_params: dict,
+    tenant_id: str = Depends(verify_bearer_token),
+    session: Session = Depends(get_session),
+):
+    logger.info(
+        "Invoking provider method", extra={"provider_id": provider_id, "method": method}
+    )
+    provider = session.exec(
+        select(Provider).where(
+            (Provider.tenant_id == tenant_id) & (Provider.id == provider_id)
+        )
+    ).one()
+
+    if not provider:
+        raise HTTPException(404, detail="Provider not found")
+
+    context_manager = ContextManager(tenant_id=tenant_id)
+    secret_manager = SecretManagerFactory.get_secret_manager(context_manager)
+    provider_config = secret_manager.read_secret(
+        provider.configuration_key, is_json=True
+    )
+    provider_instance = ProvidersFactory.get_provider(
+        context_manager, provider_id, provider.type, provider_config
+    )
+
+    func: Callable = getattr(provider_instance, method, None)
+    if not func:
+        raise HTTPException(400, detail="Method not found")
+
+    try:
+        response = func(**method_params)
+    except ProviderMethodException as e:
+        logger.exception(
+            "Failed to invoke method",
+            extra={"provider_id": provider_id, "method": method},
+        )
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    logger.info(
+        "Successfully invoked provider method",
+        extra={"provider_id": provider_id, "method": method},
+    )
+    return response
+
+
 # Webhook related endpoints
 @router.post("/install/webhook/{provider_type}/{provider_id}")
 def install_provider_webhook(
@@ -583,12 +675,15 @@ def install_provider_webhook(
     webhook_api_key = get_or_create_api_key(
         session=session,
         tenant_id=tenant_id,
+        created_by="system",
         unique_api_key_id="webhook",
         system_description="Webhooks API key",
     )
 
     try:
         provider.setup_webhook(tenant_id, keep_webhook_api_url, webhook_api_key, True)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -608,13 +703,25 @@ def get_webhook_settings(
     webhook_api_key = get_or_create_api_key(
         session=session,
         tenant_id=tenant_id,
+        created_by="system",
         unique_api_key_id="webhook",
         system_description="Webhooks API key",
     )
+    # for cases where we need webhook with auth
+    keep_webhook_api_url_with_auth = keep_webhook_api_url.replace(
+        "https://", f"https://keep:{webhook_api_key}@"
+    )
+
     logger.info("Got webhook settings", extra={"provider_type": provider_type})
     return ProviderWebhookSettings(
-        webhookDescription=provider_class.webhook_description,
+        webhookDescription=provider_class.webhook_description.format(
+            keep_webhook_api_url=keep_webhook_api_url,
+            api_key=webhook_api_key,
+            keep_webhook_api_url_with_auth=keep_webhook_api_url_with_auth,
+        ),
         webhookTemplate=provider_class.webhook_template.format(
-            keep_webhook_api_url=keep_webhook_api_url, api_key=webhook_api_key
+            keep_webhook_api_url=keep_webhook_api_url,
+            api_key=webhook_api_key,
+            keep_webhook_api_url_with_auth=keep_webhook_api_url_with_auth,
         ),
     )

@@ -26,6 +26,8 @@ class TeamsProviderAuthConfig:
 
 
 class TeamsProvider(BaseProvider):
+    """Send alert message to Teams."""
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -42,7 +44,7 @@ class TeamsProvider(BaseProvider):
         """
         pass
 
-    def notify(
+    def _notify(
         self,
         message="",
         typeCard="MessageCard",

@@ -1,7 +1,11 @@
 "use client";
-import { FrigadeAnnouncement } from "@frigade/react";
-import { Providers, defaultProvider, Provider } from "./providers";
-import { useSession } from "../../utils/customAuth";
+import {
+  Providers,
+  defaultProvider,
+  Provider,
+  ProvidersResponse,
+} from "./providers";
+import { useSession } from "next-auth/react";
 import { getApiURL } from "../../utils/apiUrl";
 import { fetcher } from "../../utils/fetcher";
 import { KeepApiError } from "../error";
@@ -9,37 +13,74 @@ import ProvidersTiles from "./providers-tiles";
 import React, { useState, Suspense, useContext, useEffect } from "react";
 import useSWR from "swr";
 import Loading from "../loading";
-import Image from "next/image";
 import { LayoutContext } from "./context";
 import { toast } from "react-toastify";
 import { updateIntercom } from "@/components/ui/Intercom";
+import { useRouter } from "next/navigation";
+import { Callout } from "@tremor/react";
 
 export const useFetchProviders = () => {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [installedProviders, setInstalledProviders] = useState<Provider[]>([]);
+  const [isSlowLoading, setIsSlowLoading] = useState<boolean>(false);
   const { data: session, status } = useSession();
   let shouldFetch = session?.accessToken ? true : false;
 
-  const { data, error } = useSWR(
+
+  const { data, error } = useSWR<ProvidersResponse>(
     shouldFetch ? `${getApiURL()}/providers` : null,
     (url) => {
       return fetcher(url, session?.accessToken!);
+    },
+    {
+      onLoadingSlow: () => setIsSlowLoading(true),
+      loadingTimeout: 5000,
+      revalidateOnFocus: false,
     }
   );
+
+  const isLocalhost = data && data.is_localhost;
+  const toastShownKey = 'localhostToastShown';
+  const ToastMessage = () => (
+    <div>
+      Webhooks are disabled because Keep is not accessible from the internet.<br /><br />
+
+      Click for Keep docs on how to enabled it 📚
+    </div>
+  );
+
+  useEffect(() => {
+    const toastShown = localStorage.getItem(toastShownKey);
+
+    if (isLocalhost && !toastShown) {
+      toast(<ToastMessage/>, {
+        type: "info",
+        position: toast.POSITION.TOP_CENTER,
+        autoClose: 10000,
+        onClick: () => window.open('https://docs.keephq.dev/development/external-url', '_blank'),
+        style: {
+          width: "250%", // Set width
+          marginLeft: "-75%", // Adjust starting position to left
+        },
+        progressStyle: { backgroundColor: 'orange' }
+      });
+      localStorage.setItem(toastShownKey, 'true');
+    }
+  }, [isLocalhost]);
 
   // process data here if it's available
   if (data && providers.length === 0 && installedProviders.length === 0) {
     // TODO: need to refactor the backend response
-    const fetchedInstalledProviders = (
-      data["installed_providers"] as Providers
-    ).map((provider) => {
-      const validatedScopes = provider.validatedScopes ?? {};
-      return {
-        ...provider,
-        installed: true,
-        validatedScopes: validatedScopes,
-      } as Provider;
-    });
+    const fetchedInstalledProviders = data.installed_providers.map(
+      (provider) => {
+        const validatedScopes = provider.validatedScopes ?? {};
+        return {
+          ...provider,
+          installed: true,
+          validatedScopes: validatedScopes,
+        } as Provider;
+      }
+    );
     // TODO: refactor this to be more readable and move to backend(?)
     const fetchedProviders = data.providers.map((provider: Provider) => {
       const updatedProvider: Provider = {
@@ -63,6 +104,7 @@ export const useFetchProviders = () => {
         oauth2_url: provider.oauth2_url,
         scopes: provider.scopes,
         validatedScopes: provider.validatedScopes,
+        tags: provider.tags,
       };
       return updatedProvider;
     }) as Providers;
@@ -77,6 +119,8 @@ export const useFetchProviders = () => {
     status,
     error,
     session,
+    isSlowLoading,
+    isLocalhost
   };
 };
 
@@ -92,9 +136,11 @@ export default function ProvidersPage({
     status,
     error,
     session,
+    isSlowLoading,
+    isLocalhost
   } = useFetchProviders();
-  const { searchProviderString } = useContext(LayoutContext);
-
+  const { searchProviderString, selectedTags } = useContext(LayoutContext);
+  const router = useRouter();
   useEffect(() => {
     if (searchParams?.oauth === "failure") {
       const reason = JSON.parse(searchParams.reason);
@@ -112,9 +158,12 @@ export default function ProvidersPage({
   }, [session?.user]);
 
   if (status === "loading") return <Loading />;
-  if (status === "unauthenticated") return <div>Unauthenticated</div>;
-  if (!providers || !installedProviders) return <Loading />;
-  if (error) throw new KeepApiError(error.message, `${getApiURL()}/providers`);
+  if (status === "unauthenticated") router.push("/signin");
+  if (!providers || !installedProviders || providers.length <= 0)
+    return <Loading slowLoading={isSlowLoading} />;
+  if (error) {
+    throw new KeepApiError(error.message, `${getApiURL()}/providers`);
+  }
 
   const addProvider = (provider: Provider) => {
     setInstalledProviders((prevProviders) => {
@@ -141,25 +190,15 @@ export default function ProvidersPage({
     );
   };
 
+  const searchTags = (provider: Provider) => {
+    return (
+      selectedTags.length === 0 ||
+      provider.tags.some((tag) => selectedTags.includes(tag))
+    );
+  };
+
   return (
-    <Suspense
-      fallback={
-        <Image src="/keep.gif" width={200} height={200} alt="Loading" />
-      }
-    >
-      <FrigadeAnnouncement
-        flowId="flow_VpefBUPWpliWceBm"
-        modalPosition="center"
-        onButtonClick={(stepData, index, cta) => {
-          if (cta === "primary") {
-            window.open(
-              "https://calendly.com/d/4p7-8dg-399/keep-onboarding",
-              "_blank"
-            );
-          }
-          return true;
-        }}
-      />
+    <>
       {installedProviders.length > 0 && (
         <ProvidersTiles
           providers={installedProviders}
@@ -169,10 +208,13 @@ export default function ProvidersPage({
         />
       )}
       <ProvidersTiles
-        providers={providers.filter(searchProviders)}
+        providers={providers.filter(
+          (provider) => searchProviders(provider) && searchTags(provider)
+        )}
         addProvider={addProvider}
         onDelete={deleteProvider}
+        isLocalhost={isLocalhost}
       />
-    </Suspense>
+    </>
   );
 }

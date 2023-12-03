@@ -1,7 +1,6 @@
 import io
 import logging
 import os
-import typing
 import uuid
 
 import requests
@@ -10,17 +9,14 @@ import yaml
 from fastapi import HTTPException
 
 from keep.api.core.db import (
-    add_workflow,
+    add_or_update_workflow,
     delete_workflow,
     get_all_workflows,
     get_raw_workflow,
     get_workflow_execution,
     get_workflows_with_last_execution,
 )
-from keep.contextmanager.contextmanager import ContextManager
 from keep.parser.parser import Parser
-from keep.providers.providers_factory import ProvidersFactory
-from keep.storagemanager.storagemanagerfactory import StorageManagerFactory
 from keep.workflowmanager.workflow import Workflow
 
 
@@ -29,19 +25,15 @@ class WorkflowStore:
         self.parser = Parser()
         self.logger = logging.getLogger(__name__)
 
-    def get_workflow_execution(
-        self, tenant_id: str, workflow_id: str, workflow_execution_id: str
-    ):
-        workflow_execution = get_workflow_execution(
-            tenant_id, workflow_id, workflow_execution_id
-        )
+    def get_workflow_execution(self, tenant_id: str, workflow_execution_id: str):
+        workflow_execution = get_workflow_execution(tenant_id, workflow_execution_id)
         return workflow_execution
 
     def create_workflow(self, tenant_id: str, created_by, workflow: dict):
         workflow_id = workflow.get("id")
         self.logger.info(f"Creating workflow {workflow_id}")
         interval = self.parser.parse_interval(workflow)
-        workflow = add_workflow(
+        workflow = add_or_update_workflow(
             id=str(uuid.uuid4()),
             name=workflow_id,
             tenant_id=tenant_id,
@@ -56,8 +48,8 @@ class WorkflowStore:
     def delete_workflow(self, tenant_id, workflow_id):
         self.logger.info(f"Deleting workflow {workflow_id}")
         try:
-            workflow = delete_workflow(tenant_id, workflow_id)
-        except Exception as e:
+            delete_workflow(tenant_id, workflow_id)
+        except Exception:
             raise HTTPException(
                 status_code=404, detail=f"Workflow {workflow_id} not found"
             )

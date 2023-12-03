@@ -3,21 +3,8 @@ import os
 import posthog
 from posthog import Posthog
 
-if not os.getenv("DISABLE_POSTHOG"):
+if os.getenv("DISABLE_POSTHOG", "false") == "true":
     posthog.disabled = True
-
-
-def get_random_user_id():
-    if os.path.exists("RANDOM_USER_ID"):
-        with open("RANDOM_USER_ID") as f:
-            return f.read()
-    else:
-        import uuid
-
-        random_user_id = str(uuid.uuid4())
-        with open("RANDOM_USER_ID", "w") as f:
-            f.write(random_user_id)
-        return random_user_id
 
 
 def get_posthog_client():

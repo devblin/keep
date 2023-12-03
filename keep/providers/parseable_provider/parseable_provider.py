@@ -6,11 +6,9 @@ import datetime
 import json
 import logging
 import os
-import random
 from uuid import uuid4
 
 import pydantic
-import requests
 
 from keep.api.models.alert import AlertDto
 from keep.contextmanager.contextmanager import ContextManager
@@ -50,9 +48,7 @@ class ParseableProviderAuthConfig:
 
 
 class ParseableProvider(BaseProvider):
-    """
-    Parseable provider class.
-    """
+    """Parseable provider to ingest data from Parseable."""
 
     webhook_description = "This is an example of how to configure an alert to be sent to Keep using Parseable's webhook feature. Post this to https://YOUR_PARSEABLE_SERVER/api/v1/logstream/YOUR_STREAM_NAME/alert"
     webhook_template = """{{
@@ -123,9 +119,7 @@ class ParseableProvider(BaseProvider):
         id = event.pop("id", str(uuid4()))
         name = event.pop("alert", "")
         status = event.pop("status", "firing")
-        lastReceived = event.pop(
-            "last_received", datetime.datetime.utcnow().isoformat()
-        )
+        lastReceived = event.pop("last_received", datetime.datetime.now().isoformat())
         decription = event.pop("failing_condition", "")
         tags = event.get("tags", {})
         if isinstance(tags, dict):

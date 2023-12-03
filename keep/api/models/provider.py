@@ -1,6 +1,10 @@
+from datetime import datetime
+from typing import Literal
+
 from pydantic import BaseModel
 
 from keep.providers.models.provider_config import ProviderScope
+from keep.providers.models.provider_method import ProviderMethod
 
 
 class Provider(BaseModel):
@@ -22,3 +26,8 @@ class Provider(BaseModel):
     oauth2_url: str | None = None
     scopes: list[ProviderScope] = []
     validatedScopes: dict[str, bool | str] | None = {}
+    methods: list[ProviderMethod] = []
+    installed_by: str | None = None
+    installation_time: datetime | None = None
+    docs: str | None = None
+    tags: list[Literal["alert", "ticketing", "messaging", "data", "queue"]] = []

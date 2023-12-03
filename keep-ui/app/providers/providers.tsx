@@ -12,6 +12,24 @@ export interface ProviderAuthConfig {
   file_type?: string;
 }
 
+export interface ProviderMethodParam {
+  name: string;
+  type: string;
+  mandatory: boolean;
+  default?: string;
+  expected_values?: string[];
+}
+
+export interface ProviderMethod {
+  name: string;
+  scopes: string[];
+  func_name: string;
+  description: string;
+  category: string;
+  type: "view" | "action";
+  func_params?: ProviderMethodParam[];
+}
+
 export interface ProviderScope {
   name: string;
   description?: string;
@@ -19,6 +37,12 @@ export interface ProviderScope {
   documentation_url?: string;
   alias?: string;
   mandatory_for_webhook: boolean;
+}
+
+export interface ProvidersResponse {
+  providers: Provider[];
+  installed_providers: Provider[];
+  is_localhost: boolean;
 }
 
 export interface Provider {
@@ -51,6 +75,8 @@ export interface Provider {
   oauth2_url?: string;
   scopes?: ProviderScope[];
   validatedScopes?: { [scopeName: string]: boolean | string };
+  methods?: ProviderMethod[];
+  tags: ("alert" | "ticketing" | "messaging" | "data" | "queue")[];
 }
 
 export type Providers = Provider[];
@@ -63,4 +89,5 @@ export const defaultProvider: Provider = {
   can_notify: false,
   can_query: false,
   type: "",
+  tags: [],
 };

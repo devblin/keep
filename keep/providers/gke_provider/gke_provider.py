@@ -1,7 +1,6 @@
 import dataclasses
 import json
 import logging
-import tempfile
 
 import pydantic
 from google.auth.transport import requests
@@ -43,6 +42,8 @@ class GkeProviderAuthConfig:
 
 
 class GkeProvider(BaseProvider):
+    """Enrich alerts with data from GKE."""
+
     PROVIDER_SCOPES = [
         ProviderScope(
             name="roles/container.viewer",
@@ -62,7 +63,7 @@ class GkeProvider(BaseProvider):
             )
             self._project_id = self._service_account_data.get("project_id")
         # in case the user didn't provide a service account JSON, we'll later fail it in validate_scopes
-        except Exception as e:
+        except Exception:
             self._service_account_data = None
             self._project_id = None
         self._region = self.authentication_config.region
@@ -80,7 +81,7 @@ class GkeProvider(BaseProvider):
         scopes = {}
         # try initializing the client to validate the scopes
         try:
-            client = self.client
+            self.client
             scopes["roles/container.viewer"] = True
         except Exception as e:
             if "404" in str(e):

@@ -5,16 +5,30 @@ import { signOut } from "next-auth/react";
 import { Fragment } from "react";
 import {
   Bars3Icon,
+  BellAlertIcon,
+  BriefcaseIcon,
   DocumentTextIcon,
+  EnvelopeOpenIcon,
+  PuzzlePieceIcon,
   XMarkIcon,
 } from "@heroicons/react/24/outline";
 import Link from "next/link";
 import { Icon } from "@tremor/react";
+import { AuthenticationType } from "utils/authenticationType";
+import useSWR from "swr";
+import { fetcher } from "utils/fetcher";
+import { User } from "next-auth";
+import { InternalConfig } from "types/internal-config";
 
 const navigation = [
-  { name: "Providers", href: "/providers" },
-  { name: "Alerts", href: "/alerts" },
-  { name: "Workflows", href: "/workflows" },
+  { name: "Providers", href: "/providers", icon: PuzzlePieceIcon },
+  { name: "Alerts", href: "/alerts", icon: BellAlertIcon },
+  { name: "Workflows", href: "/workflows", icon: BriefcaseIcon },
+  // {
+  //   name: "Notifications Hub",
+  //   href: "/notifications-hub",
+  //   icon: EnvelopeOpenIcon,
+  // },
 ];
 
 function classNames(...classes: string[]) {
@@ -65,8 +79,13 @@ const GnipLogo = (props: any) => (
   </svg>
 );
 
-export default function NavbarInner({ user }: { user: any }) {
+export default function NavbarInner({ user }: { user?: User }) {
   const pathname = usePathname();
+  const { data: configData } = useSWR<InternalConfig>("/api/config", fetcher);
+
+  // Determine runtime configuration
+  const authType = configData?.AUTH_TYPE;
+
   return (
     <Disclosure as="nav" className="bg-white shadow-sm">
       {({ open }) => (
@@ -98,6 +117,7 @@ export default function NavbarInner({ user }: { user: any }) {
                       )}
                       aria-current={pathname === item.href ? "page" : undefined}
                     >
+                      <Icon icon={item.icon} color="gray" />
                       {item.name}
                     </Link>
                   ))}
@@ -146,13 +166,21 @@ export default function NavbarInner({ user }: { user: any }) {
                   <Menu as="div" className="relative ml-3">
                     <Menu.Button className="flex rounded-full bg-white text-sm hover:ring-orange-500 hover:ring-offset-2 hover:ring-2">
                       <span className="sr-only">Open user menu</span>
-                      <Image
-                        className="h-8 w-8 rounded-full"
-                        src={user?.image || "https://avatar.vercel.sh/leerob"}
-                        height={32}
-                        width={32}
-                        alt={`${user?.name || "placeholder"} avatar`}
-                      />
+                      {
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          className="h-8 w-8 rounded-full"
+                          src={
+                            user?.image ||
+                            `https://ui-avatars.com/api/?name=${
+                              user?.name ?? user?.email
+                            }&background=random`
+                          }
+                          height={32}
+                          width={32}
+                          alt={`${user?.name ?? user?.email} profile picture`}
+                        />
+                      }
                     </Menu.Button>
                     <Transition
                       as={Fragment}
@@ -175,14 +203,16 @@ export default function NavbarInner({ user }: { user: any }) {
                               >
                                 Settings
                               </a>
-                              <button
-                                className={classNames(
-                                  "flex w-full px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
-                                )}
-                                onClick={() => signOut()}
-                              >
-                                Sign out
-                              </button>
+                              {authType != AuthenticationType.NO_AUTH ? (
+                                <button
+                                  className={classNames(
+                                    "flex w-full px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+                                  )}
+                                  onClick={() => signOut()}
+                                >
+                                  Sign out
+                                </button>
+                              ) : null}
                             </>
                           )}
                         </Menu.Item>
@@ -228,13 +258,21 @@ export default function NavbarInner({ user }: { user: any }) {
                 <>
                   <div className="flex items-center px-4">
                     <div className="flex-shrink-0">
-                      <Image
-                        className="h-8 w-8 rounded-full"
-                        src={user.image}
-                        height={32}
-                        width={32}
-                        alt={`${user.name} avatar`}
-                      />
+                      {
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          className="h-8 w-8 rounded-full"
+                          src={
+                            user?.image ||
+                            `https://ui-avatars.com/api/?name=${
+                              user?.name ?? user?.email
+                            }&background=random`
+                          }
+                          height={32}
+                          width={32}
+                          alt={`${user?.name ?? user?.email} profile picture`}
+                        />
+                      }
                     </div>
                     <div className="ml-3">
                       <div className="text-base font-medium text-gray-800">
@@ -254,12 +292,14 @@ export default function NavbarInner({ user }: { user: any }) {
                     >
                       Settings
                     </a>
-                    <button
-                      onClick={() => signOut()}
-                      className="block px-4 py-2 text-base font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-800"
-                    >
-                      Sign out
-                    </button>
+                    {authType != AuthenticationType.NO_AUTH ? (
+                      <button
+                        onClick={() => signOut()}
+                        className="block px-4 py-2 text-base font-medium text-gray-500 hover:bg-gray-100 hover:text-gray-800"
+                      >
+                        Sign out
+                      </button>
+                    ) : null}
                   </div>
                 </>
               ) : null}

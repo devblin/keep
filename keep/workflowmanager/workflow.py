@@ -1,8 +1,5 @@
 import enum
-import logging
 import typing
-
-from pydantic.dataclasses import dataclass
 
 from keep.contextmanager.contextmanager import ContextManager
 from keep.iohandler.iohandler import IOHandler
@@ -93,7 +90,16 @@ class Workflow:
     def run(self, workflow_execution_id):
         self.logger.info(f"Running workflow {self.workflow_id}")
         self.context_manager.set_execution_context(workflow_execution_id)
-        self.run_steps()
+        try:
+            self.run_steps()
+        except StepError as e:
+            self.logger.error(
+                f"Workflow {self.workflow_id} failed: {e}",
+                extra={
+                    "workflow_execution_id": workflow_execution_id,
+                },
+            )
+            raise
         actions_firing, actions_errors = self.run_actions()
         # Save the state
         #   workflow is firing if one its actions is firing

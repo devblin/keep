@@ -1,13 +1,12 @@
 import logging
 import os
 import re
-import time
 import typing
 import uuid
 
+from keep.api.core.config import AuthenticationType
 from keep.api.core.db import get_enrichment, save_workflow_results
 from keep.api.models.alert import AlertDto
-from keep.parser.parser import Parser
 from keep.providers.providers_factory import ProviderConfigurationException
 from keep.workflowmanager.workflow import Workflow
 from keep.workflowmanager.workflowscheduler import WorkflowScheduler
@@ -60,7 +59,6 @@ class WorkflowManager:
             return value == filter_val
 
     def insert_events(self, tenant_id, events: typing.List[AlertDto]):
-        workflows_that_should_be_run = []
         for event in events:
             all_workflow_models = self.workflow_store.get_all_workflows(tenant_id)
             for workflow_model in all_workflow_models:
@@ -90,27 +88,28 @@ class WorkflowManager:
                         # TODO: more sophisticated filtering/attributes/nested, etc
                         filter_key = filter.get("key")
                         filter_val = filter.get("value")
-                        if not getattr(event, filter_key, None):
+                        event_val = self._get_event_value(event, filter_key)
+                        if not event_val:
                             self.logger.warning(
                                 "Failed to run filter, skipping the event. Probably misconfigured workflow."
                             )
+                            should_run = False
                             continue
                         # if its list, check if the filter is in the list
-                        if type(getattr(event, filter_key)) == list:
-                            for val in getattr(event, filter_key):
+                        if isinstance(event_val, list):
+                            for val in event_val:
                                 # if one filter applies, it should run
                                 if self._apply_filter(filter_val, val):
                                     should_run = True
                                     break
                                 should_run = False
                         # elif the filter is string/int/float, compare them:
-                        elif type(getattr(event, filter_key, None)) in [
+                        elif type(event_val) in [
                             int,
                             str,
                             float,
                         ]:
-                            val = getattr(event, filter_key)
-                            if not self._apply_filter(filter_val, val):
+                            if not self._apply_filter(filter_val, event_val):
                                 self.logger.debug(
                                     "Filter didn't match, skipping",
                                     extra={
@@ -150,6 +149,24 @@ class WorkflowManager:
                             }
                         )
 
+    def _get_event_value(self, event, filter_key):
+        # if the filter key is a nested key, get the value
+        if "." in filter_key:
+            filter_key_split = filter_key.split(".")
+            # event is alert dto so we need getattr
+            event_val = getattr(event, filter_key_split[0], None)
+            if not event_val:
+                return None
+            # iterate the other keys
+            for key in filter_key_split[1:]:
+                event_val = event_val.get(key, None)
+                # if the key doesn't exist, return None because we didn't find the value
+                if not event_val:
+                    return None
+            return event_val
+        else:
+            return getattr(event, filter_key, None)
+
     # TODO should be fixed to support the usual CLI
     def run(self, workflows: list[Workflow]):
         """
@@ -159,7 +176,7 @@ class WorkflowManager:
             workflow (str): Either an workflow yaml or a directory containing workflow yamls or a list of URLs to get the workflows from.
             providers_file (str, optional): The path to the providers yaml. Defaults to None.
         """
-        self.logger.info(f"Running workflow(s)")
+        self.logger.info("Running workflow(s)")
         workflows_errors = []
         # If at least one workflow has an interval, run workflows using the scheduler,
         #   otherwise, just run it
@@ -191,8 +208,10 @@ class WorkflowManager:
         Raises:
             Exception: If the workflow uses premium providers in multi tenant mode.
         """
-        multi_tenant = os.environ.get("KEEP_MULTI_TENANT", False)
-        if multi_tenant and multi_tenant != "false":
+        if (
+            os.environ.get("AUTH_TYPE", AuthenticationType.NO_AUTH.value)
+            == AuthenticationType.MULTI_TENANT.value
+        ):
             for provider in workflow.workflow_providers_type:
                 if provider in self.PREMIUM_PROVIDERS:
                     raise Exception(
@@ -207,7 +226,8 @@ class WorkflowManager:
             errors = workflow.run(workflow_execution_id)
         except Exception as e:
             self.logger.error(
-                f"Error running workflow {workflow.workflow_id}", extra={"exception": e}
+                f"Error running workflow {workflow.workflow_id}",
+                extra={"exception": e, "workflow_execution_id": workflow_execution_id},
             )
             if workflow.on_failure:
                 self.logger.info(
@@ -247,7 +267,6 @@ class WorkflowManager:
         try:
             save_workflow_results(
                 tenant_id=workflow.context_manager.tenant_id,
-                workflow_id=workflow.context_manager.workflow_id,
                 workflow_execution_id=workflow_execution_id,
                 workflow_results=workflow_results,
             )

@@ -26,6 +26,8 @@ class DiscordProviderAuthConfig:
 
 
 class DiscordProvider(BaseProvider):
+    """Send alert message to Discord."""
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -42,7 +44,7 @@ class DiscordProvider(BaseProvider):
         """
         pass
 
-    def notify(self, content: str = "", components: list = [], **kwargs: dict):
+    def _notify(self, content: str = "", components: list = [], **kwargs: dict):
         """
         Notify alert message to Discord using the Discord Incoming Webhook API
         https://discord.com/developers/docs/resources/webhook

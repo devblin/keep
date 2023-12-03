@@ -2,27 +2,35 @@
 Base class for all providers.
 """
 import abc
+import copy
 import datetime
+import hashlib
 import json
-import logging
 import os
 import re
 import uuid
-from dataclasses import field
-from typing import Optional
+from typing import Literal, Optional
 
+import opentelemetry.trace as trace
 import requests
-from pydantic.dataclasses import dataclass
 
 from keep.api.core.db import enrich_alert
 from keep.api.models.alert import AlertDto
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
+from keep.providers.models.provider_method import ProviderMethod
+
+tracer = trace.get_tracer(__name__)
 
 
 class BaseProvider(metaclass=abc.ABCMeta):
     OAUTH2_URL = None
     PROVIDER_SCOPES: list[ProviderScope] = []
+    PROVIDER_METHODS: list[ProviderMethod] = []
+    FINGERPRINT_FIELDS: list[str] = []
+    PROVIDER_TAGS: list[
+        Literal["alert", "ticketing", "messaging", "data", "queue"]
+    ] = []
 
     def __init__(
         self,
@@ -54,6 +62,8 @@ class BaseProvider(metaclass=abc.ABCMeta):
         )
         self.provider_type = self._extract_type()
         self.results = []
+        # tb: we can have this overriden by customer configuration, when initializing the provider
+        self.fingerprint_fields = self.FINGERPRINT_FIELDS
 
     def _extract_type(self):
         """
@@ -111,16 +121,28 @@ class BaseProvider(metaclass=abc.ABCMeta):
             return
 
         # Now try to enrich the alert
+        self.logger.debug("Extracting the fingerprint from the alert")
         if "fingerprint" in results:
             fingerprint = results["fingerprint"]
         # else, if we are in an event context, use the event fingerprint
         elif self.context_manager.event_context:
-            fingerprint = self.context_manager.event_context.fingerprint
+            # TODO: map all casses event_context is dict and update them to the DTO
+            #       and remove this if statement
+            if isinstance(self.context_manager.event_context, dict):
+                fingerprint = self.context_manager.event_context.get("fingerprint")
+            # Alert DTO
+            else:
+                fingerprint = self.context_manager.event_context.fingerprint
         else:
-            raise Exception(
+            fingerprint = None
+
+        if not fingerprint:
+            self.logger.error(
                 "No fingerprint found for alert enrichment",
                 extra={"provider": self.provider_id},
             )
+            raise Exception("No fingerprint found for alert enrichment")
+        self.logger.debug("Fingerprint extracted", extra={"fingerprint": fingerprint})
         self._enrich_alert(fingerprint, enrich_alert, results)
         return results
 
@@ -135,12 +157,16 @@ class BaseProvider(metaclass=abc.ABCMeta):
             try:
                 if enrichment["value"].startswith("results."):
                     val = enrichment["value"].replace("results.", "")
-                    _enrichments[enrichment["key"]] = results[val]
+                    parts = val.split(".")
+                    r = copy.copy(results)
+                    for part in parts:
+                        r = r[part]
+                    _enrichments[enrichment["key"]] = r
                 else:
                     _enrichments[enrichment["key"]] = enrichment["value"]
-            except Exception as e:
+            except Exception:
                 self.logger.error(
-                    "Failed to enrich alert",
+                    f"Failed to enrich alert - enrichment: {enrichment}",
                     extra={"fingerprint": fingerprint, "provider": self.provider_id},
                 )
                 continue
@@ -149,7 +175,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
             enrich_alert(self.context_manager.tenant_id, fingerprint, _enrichments)
         except Exception as e:
             self.logger.error(
-                "Failed to enrich alert",
+                "Failed to enrich alert in db",
                 extra={"fingerprint": fingerprint, "provider": self.provider_id},
             )
             raise e
@@ -180,7 +206,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
         # just run the query
         results = self._query(**kwargs)
         # now add the type of the results to the global context
-        if results and type(results) == list:
+        if results and isinstance(results, list):
             self.context_manager.dependencies.add(results[0].__class__)
         elif results:
             self.context_manager.dependencies.add(results.__class__)
@@ -190,6 +216,30 @@ class BaseProvider(metaclass=abc.ABCMeta):
     @staticmethod
     def format_alert(event: dict) -> AlertDto | list[AlertDto]:
         raise NotImplementedError("format_alert() method not implemented")
+
+    @staticmethod
+    def get_alert_fingerprint(alert: AlertDto, fingerprint_fields: list = []) -> str:
+        """
+        Get the fingerprint of an alert.
+
+        Args:
+            event (AlertDto): The alert to get the fingerprint of.
+            fingerprint_fields (list, optional): The fields we calculate the fingerprint upon. Defaults to [].
+
+        Returns:
+            str: hexdigest of the fingerprint or the event.name if no fingerprint_fields were given.
+        """
+        if not fingerprint_fields:
+            return alert.name
+        fingerprint = hashlib.sha256()
+        event_dict = alert.dict()
+        for fingerprint_field in fingerprint_fields:
+            fingerprint_field_value = event_dict.get(fingerprint_field, None)
+            if isinstance(fingerprint_field_value, (list, dict)):
+                fingerprint_field_value = json.dumps(fingerprint_field_value)
+            if fingerprint_field_value:
+                fingerprint.update(str(fingerprint_field_value).encode())
+        return fingerprint.hexdigest()
 
     def get_alerts_configuration(self, alert_id: Optional[str] = None):
         """
@@ -211,11 +261,18 @@ class BaseProvider(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError("deploy_alert() method not implemented")
 
-    def get_alerts(self):
+    def _get_alerts(self):
         """
         Get alerts from the provider.
         """
         raise NotImplementedError("get_alerts() method not implemented")
+
+    def get_alerts(self):
+        """
+        Get alerts from the provider.
+        """
+        with tracer.start_as_current_span(f"{self.__class__.__name__}-get_alerts"):
+            return self._get_alerts()
 
     def setup_webhook(
         self, tenant_id: str, keep_api_url: str, api_key: str, setup_alerts: bool = True
@@ -338,16 +395,16 @@ class BaseProvider(metaclass=abc.ABCMeta):
             alert (dict): The alert to push.
         """
         # if this is not a dict, try to convert it to a dict
-        if not type(alert) == dict:
+        if not isinstance(alert, dict):
             try:
                 alert_data = json.loads(alert)
-            except:
+            except Exception:
                 alert_data = alert_data
         else:
             alert_data = alert
 
         # if this is still not a dict, we can't push it
-        if not type(alert_data) == dict:
+        if not isinstance(alert_data, dict):
             self.logger.warning(
                 "We currently support only alert represented as a dict, dismissing alert",
                 extra={"alert": alert},
@@ -385,8 +442,8 @@ class BaseProvider(metaclass=abc.ABCMeta):
         response = requests.post(url, json=alert_model.dict(), headers=headers)
         try:
             response.raise_for_status()
-            self.logger.info(f"Alert pushed successfully")
-        except:
+            self.logger.info("Alert pushed successfully")
+        except Exception:
             self.logger.error(
                 f"Failed to push alert to {self.provider_id}: {response.content}"
             )

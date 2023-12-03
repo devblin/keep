@@ -4,14 +4,14 @@ BashProvider is a class that implements the BaseOutputProvider.
 import shlex
 import subprocess
 
-from keep.contextmanager.contextmanager import ContextManager
-from keep.exceptions.provider_config_exception import ProviderConfigException
 from keep.iohandler.iohandler import IOHandler
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig
 
 
 class BashProvider(BaseProvider):
+    """Enrich alerts with data using Bash."""
+
     def __init__(self, context_manager, provider_id: str, config: ProviderConfig):
         super().__init__(context_manager, provider_id, config)
         self.io_handler = IOHandler(context_manager=context_manager)

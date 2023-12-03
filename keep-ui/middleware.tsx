@@ -1,27 +1,13 @@
-import { withAuth } from "next-auth/middleware";
+export { default } from "next-auth/middleware";
 
-const isSingleTenant = process.env.NEXT_PUBLIC_AUTH_ENABLED == "false";
+// matchers - https://nextjs.org/docs/pages/building-your-application/routing/middleware#matcher
 
-export default isSingleTenant
-  ? () => {}
-  : withAuth({
-      callbacks: {
-        authorized: async ({ req, token }) => {
-          const pathname = req.nextUrl.pathname;
-          if (pathname.endsWith("svg")) {
-            return true;
-          }
-          // validate that token exists and is not expired
-          // todo: understand how token shuold be validated in frontend (if it should)
-          // todo 2: refresh token?
-          if (token && (token.exp as number) > new Date().getTime() / 1000) {
-            return true;
-          }
-
-          return false;
-        },
-      },
-      pages: {
-        signIn: "/signin",
-      },
-    });
+// exclude keep_big.svg from being protected
+export const config = {
+  matcher: [
+    // Exclude two pages from the middleware:
+    // 1. Signin page (so that users can sign in)
+    // 2. keep svg (so that it can be displayed on the signin page)
+    '/((?!keep_big\\.svg$|signin$).*)',
+  ],
+};

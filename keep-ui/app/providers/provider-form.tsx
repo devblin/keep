@@ -1,8 +1,8 @@
 // TODO: refactor this file and separate in to smaller components
 //  There's also a lot of s**t in here, but it works for now 🤷‍♂️
 // @ts-nocheck
-import React, { useEffect, useState, useRef} from "react";
-import { useSession } from "../../utils/customAuth";
+import React, { useEffect, useState, useRef } from "react";
+import { useSession } from "next-auth/react";
 import { Provider } from "./providers";
 import { getApiURL } from "../../utils/apiUrl";
 import Image from "next/image";
@@ -16,7 +16,7 @@ import {
   Divider,
   TextInput,
 } from "@tremor/react";
-import { ExclamationCircleIcon } from "@heroicons/react/20/solid";
+import { ExclamationCircleIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
 import {
   QuestionMarkCircleIcon,
   ArrowLongRightIcon,
@@ -24,11 +24,14 @@ import {
   ArrowTopRightOnSquareIcon,
   ArrowDownOnSquareIcon,
   GlobeAltIcon,
+  DocumentTextIcon,
 } from "@heroicons/react/24/outline";
-import { Dialog } from '@headlessui/react';
 import { installWebhook } from "../../utils/helpers";
 import { ProviderSemiAutomated } from "./provider-semi-automated";
 import ProviderFormScopes from "./provider-form-scopes";
+import Link from 'next/link'
+
+
 
 type ProviderFormProps = {
   provider: Provider;
@@ -44,6 +47,7 @@ type ProviderFormProps = {
   isProviderNameDisabled?: boolean;
   installedProvidersMode: boolean;
   onDelete?: (provider: Provider) => void;
+  isLocalhost?: boolean;
 };
 
 const ProviderForm = ({
@@ -56,6 +60,7 @@ const ProviderForm = ({
   isProviderNameDisabled,
   installedProvidersMode,
   onDelete,
+  isLocalhost,
 }: ProviderFormProps) => {
   console.log("Loading the ProviderForm component");
   const initialData = {
@@ -84,7 +89,6 @@ const ProviderForm = ({
   const inputFileRef = useRef(null);
   const [selectedFile, setSelectedFile] = useState(null);
 
-
   const { data: session } = useSession();
 
   const accessToken = session?.accessToken;
@@ -106,6 +110,8 @@ const ProviderForm = ({
         if (response.ok) {
           response.json().then((newValidatedScopes) => {
             setProviderValidatedScopes(newValidatedScopes);
+            provider.validatedScopes = newValidatedScopes;
+            onAddProvider(provider);
             setRefreshLoading(false);
           });
         } else {
@@ -162,7 +168,7 @@ const ProviderForm = ({
 
     // If the input is a file, retrieve the file object, otherwise retrieve the value
     if (type === "file") {
-      value = event.target.files?.[0];  // Assumes single file upload
+      value = event.target.files?.[0]; // Assumes single file upload
     } else {
       value = event.target.value;
     }
@@ -213,7 +219,7 @@ const ProviderForm = ({
 
     let body;
 
-    if (Object.values(formValues).some(value => value instanceof File)) {
+    if (Object.values(formValues).some((value) => value instanceof File)) {
       // FormData for file uploads
       let formData = new FormData();
       for (let key in formValues) {
@@ -305,10 +311,22 @@ const ProviderForm = ({
   return (
     <div className="flex flex-col h-full justify-between p-5">
       <div>
+        <div className="flex flex-row">
         <Title>
           Connect to{" "}
           {provider.type.charAt(0).toLocaleUpperCase() + provider.type.slice(1)}
         </Title>
+          <Link href={`http://docs.keephq.dev/providers/documentation/${provider.type}-provider`} target="_blank">
+            <Icon
+              icon={DocumentTextIcon}
+              variant="simple"
+              color="gray"
+              size="sm"
+              tooltip={`${provider.type} provider documentation`}
+            />
+          </Link>
+        </div>
+
         {provider.provider_description && (
           <Subtitle>{provider.provider_description}</Subtitle>
         )}
@@ -353,7 +371,7 @@ const ProviderForm = ({
         )}
         <form>
           <div className="form-group">
-            {provider.oauth2_url ? (
+            {provider.oauth2_url && !provider.installed ? (
               <>
                 <Button
                   color="orange"
@@ -421,34 +439,36 @@ const ProviderForm = ({
 
                 {method.type === "file" ? (
                   <>
-                  <Button
-                    color="orange"
-                    size="md"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      inputFileRef.current.click();  // this line triggers the file input
-                    }}
-                    icon={ArrowDownOnSquareIcon}
-                  >
-                      {selectedFile ? `File Chosen: ${selectedFile}` : `Upload a ${method.name}`}
-                  </Button>
+                    <Button
+                      color="orange"
+                      size="md"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        inputFileRef.current.click(); // this line triggers the file input
+                      }}
+                      icon={ArrowDownOnSquareIcon}
+                    >
+                      {selectedFile
+                        ? `File Chosen: ${selectedFile}`
+                        : `Upload a ${method.name}`}
+                    </Button>
 
-                  <input
-                  ref={inputFileRef}
-                  type="file"
-                  id={configKey}
-                  name={configKey}
-                  accept={method.file_type}
-                  style={{ display: 'none' }}
-                  onChange={(e) => {
-                    if (e.target.files && e.target.files[0]) {
-                      setSelectedFile(e.target.files[0].name);
-                    }
-                    handleInputChange(e);
-                  }}
-                />
-                </>
+                    <input
+                      ref={inputFileRef}
+                      type="file"
+                      id={configKey}
+                      name={configKey}
+                      accept={method.file_type}
+                      style={{ display: "none" }}
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files[0]) {
+                          setSelectedFile(e.target.files[0].name);
+                        }
+                        handleInputChange(e);
+                      }}
+                    />
+                  </>
                 ) : (
                   <TextInput
                     type={isSensitive ? "password" : method.type} // Display as password if sensitive
@@ -461,38 +481,49 @@ const ProviderForm = ({
                     placeholder={method.placeholder || "Enter " + configKey}
                   />
                 )}
-
               </div>
             );
           })}
-          {provider.can_setup_webhook && !installedProvidersMode && (
-            <div className="flex items-center w-full" key="install_webhook">
-              <input
-                type="checkbox"
-                id="install_webhook"
-                name="install_webhook"
-                className="mr-2.5"
-                onChange={handleWebhookChange}
-                checked={formValues["install_webhook"] || false}
-              />
-              <label
-                htmlFor="install_webhook"
-                className="flex items-center w-full"
-              >
-                <Text className="capitalize">Install Webhook</Text>
-                <Icon
-                  icon={QuestionMarkCircleIcon}
-                  variant="simple"
-                  color="gray"
-                  size="sm"
-                  tooltip={`Whether to install Keep as a webhook integration in ${provider.type}.
+          <div className="w-full mt-2" key="install_webhook">
+            {provider.can_setup_webhook && !installedProvidersMode && (
+              <div className={`${isLocalhost ? 'bg-gray-100 p-2' : ''}`}>
+                <div className="flex items-center">
+                  <input
+                    type="checkbox"
+                    id="install_webhook"
+                    name="install_webhook"
+                    className="mr-2.5"
+                    onChange={handleWebhookChange}
+                    checked={(formValues["install_webhook"] || false) && !isLocalhost}
+                    disabled={isLocalhost}
+                  />
+                  <label htmlFor="install_webhook" className="flex items-center">
+                    <Text className="capitalize">Install Webhook</Text>
+                    <Icon
+                      icon={QuestionMarkCircleIcon}
+                      variant="simple"
+                      color="gray"
+                      size="sm"
+                      tooltip={`Whether to install Keep as a webhook integration in ${provider.type}. This allows Keep to asynchronously receive alerts from ${provider.type}. Please note that this will install a new integration in ${provider.type} and slightly modify your monitors/notification policy to include Keep.`}
+                    />
+                  </label>
+                </div>
+                {isLocalhost && (
+                  <span className="text-sm">
+                    <Callout className="mt-4" icon={ExclamationTriangleIcon} color="gray">
+                        <a href="https://docs.keephq.dev/development/external-url" target="_blank" rel="noopener noreferrer">
+                        Webhook installation is disabled because Keep is running without an external URL.
+                        <br/><br/>
+                        Click to learn more
+                        </a>
 
-                  This allows Keep to asynchronously receive alerts from ${provider.type}.
-                  Please note that this will install a new integration in ${provider.type} and slightly modify your monitors/notificaiton policy to include Keep.`}
-                />
-              </label>
-            </div>
-          )}
+                    </Callout>
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
           {provider.can_setup_webhook && installedProvidersMode && (
             <Button
               icon={GlobeAltIcon}

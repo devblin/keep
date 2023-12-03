@@ -3,13 +3,12 @@ PlannerProvider is a class that provides a way to read data from Microsoft Plann
 and create tasks in planner.
 """
 import dataclasses
+from urllib.parse import urljoin
 
 import pydantic
 import requests
-from urllib.parse import urljoin
 
 from keep.contextmanager.contextmanager import ContextManager
-from keep.exceptions.provider_config_exception import ProviderConfigException
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig
 from keep.providers.providers_factory import ProvidersFactory
@@ -22,27 +21,31 @@ class PlannerProviderAuthConfig:
     tenant_id: str | None = dataclasses.field(
         metadata={
             "required": True,
-            "description": "Planner Tenant ID", "sensitive": True
+            "description": "Planner Tenant ID",
+            "sensitive": True,
         },
     )
     client_id: str | None = dataclasses.field(
         metadata={
             "required": True,
-            "description": "Planner Client ID", "sensitive": True
+            "description": "Planner Client ID",
+            "sensitive": True,
         }
     )
     client_secret: str | None = dataclasses.field(
         metadata={
             "required": True,
-            "description": "Planner Client Secret", "sensitive": True
+            "description": "Planner Client Secret",
+            "sensitive": True,
         }
     )
 
 
 class PlannerProvider(BaseProvider):
     """
-    Microsoft Planner provider class.
+    Create tasks in Microsoft Planner.
     """
+
     MS_GRAPH_BASE_URL = "https://graph.microsoft.com"
     MS_PLANS_URL = urljoin(base=MS_GRAPH_BASE_URL, url="/v1.0/planner/plans")
     MS_TASKS_URL = urljoin(base=MS_GRAPH_BASE_URL, url="/v1.0/planner/tasks")
@@ -56,7 +59,7 @@ class PlannerProvider(BaseProvider):
         self.__access_token = self.__generate_access_token()
         self.__headers = {
             "Authorization": f"Bearer {self.__access_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
 
     def __generate_access_token(self):
@@ -66,22 +69,19 @@ class PlannerProvider(BaseProvider):
 
         MS_TOKEN_URL = urljoin(
             base=self.MS_AUTH_BASE_URL,
-            url=f"/{self.authentication_config.tenant_id}/oauth2/token"
+            url=f"/{self.authentication_config.tenant_id}/oauth2/token",
         )
 
         request_body = {
             "grant_type": "client_credentials",
             "client_id": self.authentication_config.client_id,
             "client_secret": self.authentication_config.client_secret,
-            "resource": self.MS_GRAPH_RESOURCE
+            "resource": self.MS_GRAPH_RESOURCE,
         }
 
         self.logger.info("Generating planner access token...")
 
-        response = requests.post(
-            url=MS_TOKEN_URL,
-            data=request_body
-        )
+        response = requests.post(url=MS_TOKEN_URL, data=request_body)
 
         response.raise_for_status()
 
@@ -102,7 +102,7 @@ class PlannerProvider(BaseProvider):
             **self.config.authentication
         )
 
-    def __get_plan_by_id(self,  plan_id=""):
+    def __get_plan_by_id(self, plan_id=""):
         """
         Helper method to fetch the plan details by id.
         """
@@ -111,10 +111,7 @@ class PlannerProvider(BaseProvider):
 
         self.logger.info(f"Fetching plan by id: {plan_id}")
 
-        response = requests.get(
-            url=MS_PLAN_URL,
-            headers=self.__headers
-        )
+        response = requests.get(url=MS_PLAN_URL, headers=self.__headers)
 
         # in case of error response
         response.raise_for_status()
@@ -130,18 +127,12 @@ class PlannerProvider(BaseProvider):
         Helper method to create a task in Planner.
         """
 
-        request_body = {
-            "planId": plan_id,
-            "title": title,
-            "bucketId": bucket_id
-        }
+        request_body = {"planId": plan_id, "title": title, "bucketId": bucket_id}
 
         self.logger.info(f"Creating new task with title: {title}")
 
         response = requests.post(
-            url=self.MS_TASKS_URL,
-            headers=self.__headers,
-            json=request_body
+            url=self.MS_TASKS_URL, headers=self.__headers, json=request_body
         )
 
         # in case of error response
@@ -150,26 +141,20 @@ class PlannerProvider(BaseProvider):
         response_data = response.json()
 
         self.logger.info(
-            "Created new task with id:%s and title:%s", response_data["id"], response_data["title"]
+            "Created new task with id:%s and title:%s",
+            response_data["id"],
+            response_data["title"],
         )
 
         return response_data
 
-    def notify(
-        self,
-        plan_id="",
-        title="",
-        bucket_id=None,
-        **kwargs: dict
-    ):
+    def _notify(self, plan_id="", title="", bucket_id=None, **kwargs: dict):
         # to verify if the plan with plan_id exists or not
-        plan = self.__get_plan_by_id(plan_id=plan_id)
+        self.__get_plan_by_id(plan_id=plan_id)
 
         # create a new task in given plan
         created_task = self.__create_task(
-            plan_id=plan_id,
-            title=title,
-            bucket_id=bucket_id
+            plan_id=plan_id, title=title, bucket_id=bucket_id
         )
 
         return created_task
@@ -179,10 +164,7 @@ if __name__ == "__main__":
     # Output debug messages
     import logging
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        handlers=[logging.StreamHandler()]
-    )
+    logging.basicConfig(level=logging.DEBUG, handlers=[logging.StreamHandler()])
     context_manager = ContextManager(
         tenant_id="singletenant",
         workflow_id="test",
@@ -199,7 +181,7 @@ if __name__ == "__main__":
         "authentication": {
             "client_id": planner_client_id,
             "client_secret": planner_client_secret,
-            "tenant_id": planner_tenant_id
+            "tenant_id": planner_tenant_id,
         },
     }
 
@@ -210,9 +192,6 @@ if __name__ == "__main__":
         provider_config=config,
     )
 
-    result = provider.notify(
-        plan_id="YOUR_PLANNER_ID",
-        title="Keep HQ Task1"
-    )
+    result = provider.notify(plan_id="YOUR_PLANNER_ID", title="Keep HQ Task1")
 
     print(result)

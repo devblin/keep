@@ -1,16 +1,17 @@
+import hashlib
 import json
 import logging
 import os
-import time
 from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pymysql
+import validators
 from google.cloud.sql.connector import Connector
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, desc, func, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import aliased, joinedload, subqueryload
+from sqlalchemy.orm import joinedload, subqueryload
 from sqlmodel import Session, SQLModel, create_engine, select
 
 # This import is required to create the tables
@@ -118,22 +119,39 @@ def get_session() -> Session:
     Yields:
         Session: A database session
     """
-    with Session(engine) as session:
-        yield session
+    from opentelemetry import trace
+
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span("get_session"):
+        with Session(engine) as session:
+            yield session
 
 
 def try_create_single_tenant(tenant_id: str) -> None:
     try:
+        # if Keep is not multitenant, let's import the User table too:
+        from keep.api.models.db.user import User
+
         create_db_and_tables()
-    except:
+    except Exception:
         pass
     with Session(engine) as session:
         try:
             # Do everything related with single tenant creation in here
             session.add(Tenant(id=tenant_id, name="Single Tenant"))
+            default_username = os.environ.get("KEEP_DEFAULT_USERNAME", "keep")
+            default_password = hashlib.sha256(
+                os.environ.get("KEEP_DEFAULT_PASSWORD", "keep").encode()
+            ).hexdigest()
+            default_user = User(
+                username=default_username, password_hash=default_password
+            )
+            session.add(default_user)
             session.commit()
         except IntegrityError:
             # Tenant already exists
+            pass
+        except Exception:
             pass
 
 
@@ -294,23 +312,54 @@ def get_workflows_that_should_run():
         return workflows_to_run
 
 
-def add_workflow(
-    id, name, tenant_id, description, created_by, interval, workflow_raw
+def add_or_update_workflow(
+    id,
+    name,
+    tenant_id,
+    description,
+    created_by,
+    interval,
+    workflow_raw,
+    updated_by=None,
 ) -> Workflow:
-    with Session(engine) as session:
-        workflow = Workflow(
-            id=id,
-            name=name,
-            tenant_id=tenant_id,
-            description=description,
-            created_by=created_by,
-            interval=interval,
-            workflow_raw=workflow_raw,
+    with Session(engine, expire_on_commit=False) as session:
+        # TODO: we need to better understanad if that's the right behavior we want
+        existing_workflow = (
+            session.query(Workflow)
+            .filter_by(name=name)
+            .filter_by(tenant_id=tenant_id)
+            .first()
         )
-        session.add(workflow)
+
+        if existing_workflow:
+            # tb: no need to override the id field here because it has foreign key constraints.
+            existing_workflow.tenant_id = tenant_id
+            existing_workflow.description = description
+            existing_workflow.updated_by = (
+                updated_by or existing_workflow.updated_by
+            )  # Update the updated_by field if provided
+            existing_workflow.interval = interval
+            existing_workflow.workflow_raw = workflow_raw
+            existing_workflow.revision += 1  # Increment the revision
+            existing_workflow.last_updated = datetime.now()  # Update last_updated
+            existing_workflow.is_deleted = False
+
+        else:
+            # Create a new workflow
+            workflow = Workflow(
+                id=id,
+                name=name,
+                tenant_id=tenant_id,
+                description=description,
+                created_by=created_by,
+                updated_by=updated_by,  # Set updated_by to the provided value
+                interval=interval,
+                workflow_raw=workflow_raw,
+            )
+            session.add(workflow)
+
         session.commit()
-        session.refresh(workflow)
-    return workflow
+        return existing_workflow if existing_workflow else workflow
 
 
 def get_workflows_with_last_execution(tenant_id: str) -> List[dict]:
@@ -363,12 +412,21 @@ def get_all_workflows(tenant_id: str) -> List[Workflow]:
 
 def get_workflow(tenant_id: str, workflow_id: str) -> Workflow:
     with Session(engine) as session:
-        workflow = session.exec(
-            select(Workflow)
-            .where(Workflow.tenant_id == tenant_id)
-            .where(Workflow.id == workflow_id)
-            .where(Workflow.is_deleted == False)
-        ).first()
+        # if the workflow id is uuid:
+        if validators.uuid(workflow_id):
+            workflow = session.exec(
+                select(Workflow)
+                .where(Workflow.tenant_id == tenant_id)
+                .where(Workflow.id == workflow_id)
+                .where(Workflow.is_deleted == False)
+            ).first()
+        else:
+            workflow = session.exec(
+                select(Workflow)
+                .where(Workflow.tenant_id == tenant_id)
+                .where(Workflow.name == workflow_id)
+                .where(Workflow.is_deleted == False)
+            ).first()
     if not workflow:
         return None
     return workflow
@@ -410,8 +468,8 @@ def finish_workflow_execution(tenant_id, workflow_id, execution_id, status, erro
         workflow_execution.status = status
         workflow_execution.error = error
         workflow_execution.execution_time = (
-            time.time() - workflow_execution.started.timestamp()
-        )
+            datetime.utcnow() - workflow_execution.started
+        ).total_seconds()
         # TODO: logs
         session.commit()
 
@@ -447,6 +505,7 @@ def get_workflow_id(tenant_id, workflow_name):
             select(Workflow)
             .where(Workflow.tenant_id == tenant_id)
             .where(Workflow.name == workflow_name)
+            .where(Workflow.is_deleted == False)
         ).first()
 
         if workflow:
@@ -472,14 +531,11 @@ def push_logs_to_db(log_entries):
         session.commit()
 
 
-def get_workflow_execution(
-    tenant_id: str, workflow_id: str, workflow_execution_id: str
-):
+def get_workflow_execution(tenant_id: str, workflow_execution_id: str):
     with Session(engine) as session:
         execution_with_logs = (
             session.query(WorkflowExecution)
             .filter(
-                WorkflowExecution.workflow_id == workflow_id,
                 WorkflowExecution.id == workflow_execution_id,
             )
             .options(joinedload(WorkflowExecution.logs))
@@ -490,22 +546,49 @@ def get_workflow_execution(
     return execution_with_logs
 
 
+def get_last_workflow_executions(tenant_id: str, limit=20):
+    with Session(engine) as session:
+        execution_with_logs = (
+            session.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.tenant_id == tenant_id,
+            )
+            .order_by(desc(WorkflowExecution.started))
+            .limit(limit)
+            .options(joinedload(WorkflowExecution.logs))
+            .all()
+        )
+
+        return execution_with_logs
+
+
 def enrich_alert(tenant_id, fingerprint, enrichments):
     # else, the enrichment doesn't exist, create it
     with Session(engine) as session:
         enrichment = get_enrichment_with_session(session, tenant_id, fingerprint)
         if enrichment:
-            enrichment.enrichments.update(enrichments)
+            # SQLAlchemy doesn't support updating JSON fields, so we need to do it manually
+            # https://github.com/sqlalchemy/sqlalchemy/discussions/8396#discussion-4308891
+            new_enrichment_data = {**enrichment.enrichments, **enrichments}
+            stmt = (
+                update(AlertEnrichment)
+                .where(AlertEnrichment.id == enrichment.id)
+                .values(enrichments=new_enrichment_data)
+            )
+            session.execute(stmt)
             session.commit()
+            # Refresh the instance to get updated data from the database
+            session.refresh(enrichment)
             return enrichment
-        alert_enrichment = AlertEnrichment(
-            tenant_id=tenant_id,
-            alert_fingerprint=fingerprint,
-            enrichments=enrichments,
-        )
-        session.add(alert_enrichment)
-        session.commit()
-    return alert_enrichment
+        else:
+            alert_enrichment = AlertEnrichment(
+                tenant_id=tenant_id,
+                alert_fingerprint=fingerprint,
+                enrichments=enrichments,
+            )
+            session.add(alert_enrichment)
+            session.commit()
+            return alert_enrichment
 
 
 def get_enrichment(tenant_id, fingerprint):
@@ -516,6 +599,25 @@ def get_enrichment(tenant_id, fingerprint):
             .where(AlertEnrichment.alert_fingerprint == fingerprint)
         ).first()
     return alert_enrichment
+
+
+def get_enrichments(
+    tenant_id: int, fingerprints: List[str]
+) -> List[Optional[AlertEnrichment]]:
+    """
+    Get a list of alert enrichments for a list of fingerprints using a single DB query.
+
+    :param tenant_id: The tenant ID to filter the alert enrichments by.
+    :param fingerprints: A list of fingerprints to get the alert enrichments for.
+    :return: A list of AlertEnrichment objects or None for each fingerprint.
+    """
+    with Session(engine) as session:
+        result = session.exec(
+            select(AlertEnrichment)
+            .where(AlertEnrichment.tenant_id == tenant_id)
+            .where(AlertEnrichment.alert_fingerprint.in_(fingerprints))
+        ).all()
+    return result
 
 
 def get_enrichment_with_session(session, tenant_id, fingerprint):
@@ -558,7 +660,7 @@ def get_alerts_with_filters(tenant_id, provider_id=None, filters=None):
     return alerts
 
 
-def get_alerts(tenant_id, provider_id=None):
+def get_alerts(tenant_id, provider_id=None) -> List[Alert]:
     with Session(engine) as session:
         # Create the query
         query = session.query(Alert)
@@ -578,16 +680,118 @@ def get_alerts(tenant_id, provider_id=None):
     return alerts
 
 
-def save_workflow_results(
-    tenant_id, workflow_id, workflow_execution_id, workflow_results
-):
+def get_api_key(api_key: str):
+    with Session(engine) as session:
+        api_key_hashed = hashlib.sha256(api_key.encode()).hexdigest()
+        statement = select(TenantApiKey).where(TenantApiKey.key_hash == api_key_hashed)
+        tenant_api_key = session.exec(statement).first()
+    return tenant_api_key
+
+
+def get_user_by_api_key(api_key: str):
+    api_key = get_api_key(api_key)
+    return api_key.created_by
+
+
+# this is only for single tenant
+def get_user(username, password, update_sign_in=True):
+    from keep.api.core.dependencies import SINGLE_TENANT_UUID
+    from keep.api.models.db.user import User
+
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    with Session(engine, expire_on_commit=False) as session:
+        user = session.exec(
+            select(User)
+            .where(User.tenant_id == SINGLE_TENANT_UUID)
+            .where(User.username == username)
+            .where(User.password_hash == password_hash)
+        ).first()
+        if user and update_sign_in:
+            user.last_sign_in = datetime.utcnow()
+            session.add(user)
+            session.commit()
+    return user
+
+
+def get_users():
+    from keep.api.core.dependencies import SINGLE_TENANT_UUID
+    from keep.api.models.db.user import User
+
+    with Session(engine) as session:
+        users = session.exec(
+            select(User).where(User.tenant_id == SINGLE_TENANT_UUID)
+        ).all()
+    return users
+
+
+def delete_user(username):
+    from keep.api.core.dependencies import SINGLE_TENANT_UUID
+    from keep.api.models.db.user import User
+
+    with Session(engine) as session:
+        user = session.exec(
+            select(User)
+            .where(User.tenant_id == SINGLE_TENANT_UUID)
+            .where(User.username == username)
+        ).first()
+        if user:
+            session.delete(user)
+            session.commit()
+
+
+def create_user(username, password):
+    from keep.api.core.dependencies import SINGLE_TENANT_UUID
+    from keep.api.models.db.user import User
+
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    with Session(engine) as session:
+        user = User(
+            tenant_id=SINGLE_TENANT_UUID,
+            username=username,
+            password_hash=password_hash,
+        )
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+    return user
+
+
+def save_workflow_results(tenant_id, workflow_execution_id, workflow_results):
     with Session(engine) as session:
         workflow_execution = session.exec(
             select(WorkflowExecution)
             .where(WorkflowExecution.tenant_id == tenant_id)
-            .where(WorkflowExecution.workflow_id == workflow_id)
             .where(WorkflowExecution.id == workflow_execution_id)
-        ).first()
+        ).one()
 
         workflow_execution.results = workflow_results
         session.commit()
+
+
+def get_workflow_id_by_name(tenant_id, workflow_name):
+    with Session(engine) as session:
+        workflow = session.exec(
+            select(Workflow)
+            .where(Workflow.tenant_id == tenant_id)
+            .where(Workflow.name == workflow_name)
+            .where(Workflow.is_deleted == False)
+        ).first()
+
+        if workflow:
+            return workflow.id
+
+
+def get_previous_execution_id(tenant_id, workflow_id, workflow_execution_id):
+    with Session(engine) as session:
+        previous_execution = session.exec(
+            select(WorkflowExecution)
+            .where(WorkflowExecution.tenant_id == tenant_id)
+            .where(WorkflowExecution.workflow_id == workflow_id)
+            .where(WorkflowExecution.id != workflow_execution_id)
+            .order_by(WorkflowExecution.started.desc())
+            .limit(1)
+        ).first()
+        if previous_execution:
+            return previous_execution
+        else:
+            return None

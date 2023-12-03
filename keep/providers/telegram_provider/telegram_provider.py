@@ -26,6 +26,8 @@ class TelegramProviderAuthConfig:
 
 
 class TelegramProvider(BaseProvider):
+    """Send alert message to Telegram."""
+
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
     ):
@@ -60,7 +62,7 @@ class TelegramProvider(BaseProvider):
             )
         telegram_bot = telegram.Bot(token=self.authentication_config.bot_token)
         try:
-            resp = await telegram_bot.send_message(chat_id=chat_id, text=message)
+            await telegram_bot.send_message(chat_id=chat_id, text=message)
         except Exception as e:
             raise ProviderException(
                 f"{self.__class__.__name__} failed to notify alert message to Telegram: {e}"

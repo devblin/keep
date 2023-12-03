@@ -6,12 +6,14 @@ import inspect
 import logging
 import os
 from dataclasses import fields
+from typing import get_args
 
 from keep.api.core.db import get_consumer_providers, get_installed_providers
 from keep.api.models.provider import Provider
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig
+from keep.providers.models.provider_method import ProviderMethodDTO, ProviderMethodParam
 from keep.secretmanager.secretmanagerfactory import SecretManagerFactory
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,8 @@ class ProviderConfigurationException(Exception):
 
 
 class ProvidersFactory:
+    _loaded_providers_cache = None
+
     @staticmethod
     def get_provider_class(provider_type: str) -> BaseProvider:
         provider_type_split = provider_type.split(
@@ -99,6 +103,10 @@ class ProvidersFactory:
         Returns:
             BaseProvider: The provider class.
         """
+        # support for provider types with subtypes e.g. auth0.logs, github.stars
+        # todo: if some day there will be different conf for auth0.logs and auth0.users, this will need to be revisited
+        if "." in provider_type:
+            provider_type = provider_type.split(".")[0]
         module = importlib.import_module(
             f"keep.providers.{provider_type}_provider.{provider_type}_provider"
         )
@@ -107,11 +115,41 @@ class ProvidersFactory:
                 module, provider_type.title().replace("_", "") + "ProviderAuthConfig"
             )
             return provider_auth_config_class
-        except ImportError:
+        except (ImportError, AttributeError):
             logging.getLogger(__name__).warning(
                 f"Provider {provider_type} does not have a provider auth config class"
             )
             return {}
+
+    def __get_methods(provider_class: BaseProvider) -> list[ProviderMethodDTO]:
+        methods = []
+        for method in provider_class.PROVIDER_METHODS:
+            params = dict(
+                inspect.signature(
+                    provider_class.__dict__.get(method.func_name)
+                ).parameters
+            )
+            func_params = []
+            for param in params:
+                if param == "self":
+                    continue
+                mandatory = True
+                default = None
+                if getattr(params[param].default, "__name__", None) != "_empty":
+                    mandatory = False
+                    default = str(params[param].default)
+                expected_values = list(get_args(params[param].annotation))
+                func_params.append(
+                    ProviderMethodParam(
+                        name=param,
+                        type=params[param].annotation.__name__,
+                        mandatory=mandatory,
+                        default=default,
+                        expected_values=expected_values,
+                    )
+                )
+            methods.append(ProviderMethodDTO(**method.dict(), func_params=func_params))
+        return methods
 
     @staticmethod
     def get_all_providers() -> list[Provider]:
@@ -121,6 +159,13 @@ class ProvidersFactory:
         Returns:
             list: All the providers.
         """
+        logger = logging.getLogger(__name__)
+        # use the cache if exists
+        if ProvidersFactory._loaded_providers_cache:
+            logger.info("Using cached providers")
+            return ProvidersFactory._loaded_providers_cache
+
+        logger.info("Loading providers")
         providers = []
         blacklisted_providers = [
             "base_provider",
@@ -205,6 +250,22 @@ class ProvidersFactory:
                     "provider_description"
                 )
                 oauth2_url = provider_class.__dict__.get("OAUTH2_URL")
+                docs = provider_class.__doc__
+
+                provider_tags = []
+                provider_tags.extend(provider_class.PROVIDER_TAGS)
+                if can_query and "data" not in provider_tags:
+                    provider_tags.append("data")
+                if (
+                    supports_webhook
+                    or can_setup_webhook
+                    and "alert" not in provider_tags
+                ):
+                    provider_tags.append("alert")
+                if can_notify and "ticketing" not in provider_tags:
+                    provider_tags.append("messaging")
+
+                provider_methods = ProvidersFactory.__get_methods(provider_class)
                 providers.append(
                     Provider(
                         type=provider_type,
@@ -218,11 +279,16 @@ class ProvidersFactory:
                         provider_description=provider_description,
                         oauth2_url=oauth2_url,
                         scopes=scopes,
+                        docs=docs,
+                        methods=provider_methods,
+                        tags=provider_tags,
                     )
                 )
             except ModuleNotFoundError:
                 logger.exception(f"Cannot import provider {provider_directory}")
                 continue
+
+        ProvidersFactory._loaded_providers_cache = providers
         return providers
 
     @staticmethod
@@ -251,6 +317,8 @@ class ProvidersFactory:
                 continue
             provider_copy = provider.copy()
             provider_copy.id = p.id
+            provider_copy.installed_by = p.installed_by
+            provider_copy.installation_time = p.installation_time
             try:
                 provider_auth = {"name": p.name}
                 if include_details:

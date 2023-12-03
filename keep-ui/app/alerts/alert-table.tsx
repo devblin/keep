@@ -5,67 +5,137 @@ import {
   TableHeaderCell,
   Icon,
   Callout,
+  Text,
+  Button,
+  Select,
+  SelectItem,
 } from "@tremor/react";
 import { AlertsTableBody } from "./alerts-table-body";
 import { Alert, AlertTableKeys } from "./models";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTransition } from "./alert-transition";
 import {
   CircleStackIcon,
   QuestionMarkCircleIcon,
 } from "@heroicons/react/24/outline";
+import { Provider } from "app/providers/providers";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  TableCellsIcon,
+} from "@heroicons/react/20/solid";
+import { User } from "app/settings/models";
+import { User as NextUser } from "next-auth";
 
 interface Props {
-  data: Alert[];
+  alerts: Alert[];
   groupBy?: string;
+  groupedByAlerts?: { [key: string]: Alert[] };
   workflows?: any[];
+  providers?: Provider[];
+  mutate?: () => void;
+  isAsyncLoading?: boolean;
+  onDelete?: (fingerprint: string, restore?: boolean) => void;
+  setAssignee?: (fingerprint: string, unassign: boolean) => void;
+  users?: User[];
+  currentUser: NextUser;
+  deletedCount?: number;
 }
 
-export function AlertTable({ data, groupBy, workflows }: Props) {
+export function AlertTable({
+  alerts,
+  groupedByAlerts = {},
+  groupBy,
+  workflows,
+  providers,
+  mutate,
+  isAsyncLoading = false,
+  onDelete,
+  setAssignee,
+  users = [],
+  currentUser,
+  deletedCount = 0,
+}: Props) {
   const [selectedAlertHistory, setSelectedAlertHistory] = useState<Alert[]>([]);
   const [isOpen, setIsOpen] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [defaultPageSize, setDefaultPageSize] = useState(10);
 
-  let groupedByData = {} as { [key: string]: Alert[] };
-  let aggregatedData = data;
-  if (groupBy) {
-    // Group alerts by the groupBy key
-    groupedByData = data.reduce((acc, alert) => {
-      const key = (alert as any)[groupBy] as string;
-      if (!acc[key]) {
-        acc[key] = [alert];
-      } else {
-        acc[key].push(alert);
-      }
-      return acc;
-    }, groupedByData);
-    // Sort by last received
-    Object.keys(groupedByData).forEach((key) =>
-      groupedByData[key].sort(
-        (a, b) => b.lastReceived.getTime() - a.lastReceived.getTime()
-      )
-    );
-    // Only the last state of each alert is shown if we group by something
-    aggregatedData = Object.keys(groupedByData).map(
-      (key) => groupedByData[key][0]
-    );
-  }
   const closeModal = (): any => setIsOpen(false);
   const openModal = (alert: Alert): any => {
-    setSelectedAlertHistory(groupedByData[(alert as any)[groupBy!]]);
+    setSelectedAlertHistory(groupedByAlerts[(alert as any)[groupBy!]]);
     setIsOpen(true);
   };
 
-  return data.length === 0 ? (
-    <Callout
-      title="No Data"
-      icon={CircleStackIcon}
-      color="yellow"
-      className="mt-5"
-    >
-      Please connect supported providers to see alerts
-    </Callout>
-  ) : (
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [alerts]);
+
+  function renderPagination() {
+    if (!defaultPageSize) return null;
+
+    const totalPages = Math.ceil(alerts.length / defaultPageSize);
+    const startItem = (currentPage - 1) * defaultPageSize + 1;
+    const endItem = Math.min(currentPage * defaultPageSize, alerts.length);
+
+    return (
+      <div className="flex justify-between items-center">
+        <Text>
+          Showing {startItem} – {endItem} of {alerts.length}{" "}
+          {deletedCount > 0 && `(there are ${deletedCount} deleted alerts)`}
+        </Text>
+        <div className="flex">
+          <Select
+            value={defaultPageSize.toString()}
+            enableClear={false}
+            onValueChange={(value) => {
+              setDefaultPageSize(parseInt(value));
+              setCurrentPage(1);
+            }}
+            className="mr-2"
+            icon={TableCellsIcon}
+          >
+            <SelectItem value="10">10</SelectItem>
+            <SelectItem value="20">20</SelectItem>
+            <SelectItem value="50">50</SelectItem>
+            <SelectItem value="100">100</SelectItem>
+          </Select>
+          <Button
+            icon={ArrowLeftIcon}
+            onClick={() => setCurrentPage(currentPage - 1)}
+            size="xs"
+            color="orange"
+            variant="secondary"
+            disabled={currentPage === 1}
+          />
+          <Button
+            icon={ArrowRightIcon}
+            onClick={() => setCurrentPage(currentPage + 1)}
+            size="xs"
+            disabled={currentPage === totalPages}
+            color="orange"
+            variant="secondary"
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const startIndex = (currentPage - 1) * defaultPageSize;
+  const endIndex = startIndex + defaultPageSize;
+
+  return (
     <>
+      {isAsyncLoading && (
+        <Callout
+          title="Getting your alerts..."
+          icon={CircleStackIcon}
+          color="gray"
+          className="mt-5"
+        >
+          Alerts will show up in this table as they are added to Keep...
+        </Callout>
+      )}
       <Table>
         <TableHead>
           <TableRow>
@@ -88,17 +158,29 @@ export function AlertTable({ data, groupBy, workflows }: Props) {
           </TableRow>
         </TableHead>
         <AlertsTableBody
-          data={aggregatedData}
+          alerts={alerts
+            .sort((a, b) => b.lastReceived.getTime() - a.lastReceived.getTime())
+            .slice(startIndex, endIndex)}
           groupBy={groupBy}
-          groupedByData={groupedByData}
+          groupedByData={groupedByAlerts}
           openModal={openModal}
           workflows={workflows}
+          providers={providers}
+          mutate={mutate}
+          showSkeleton={isAsyncLoading}
+          onDelete={onDelete}
+          setAssignee={setAssignee}
+          users={users}
+          currentUser={currentUser}
         />
       </Table>
+      {renderPagination()}
       <AlertTransition
         isOpen={isOpen}
         closeModal={closeModal}
         data={selectedAlertHistory}
+        users={users}
+        currentUser={currentUser}
       />
     </>
   );

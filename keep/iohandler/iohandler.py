@@ -2,11 +2,10 @@ import ast
 import copy
 
 # TODO: fix this! It screws up the eval statement if these are not imported
-import datetime
-import json
+import io
 import logging
 import re
-from decimal import Decimal
+import sys
 
 import astunparse
 import chevron
@@ -14,6 +13,11 @@ import requests
 
 import keep.functions as keep_functions
 from keep.contextmanager.contextmanager import ContextManager
+from keep.step.step_provider_parameter import StepProviderParameter
+
+
+class RenderException(Exception):
+    pass
 
 
 class IOHandler:
@@ -30,7 +34,7 @@ class IOHandler:
         ):
             self.shorten_urls = True
 
-    def render(self, template):
+    def render(self, template, safe=False, default=""):
         # rendering is only support for strings
         if not isinstance(template, str):
             return template
@@ -44,7 +48,7 @@ class IOHandler:
             raise Exception(
                 f"Invalid template - number of ( and ) does not match {template}"
             )
-        val = self.parse(template)
+        val = self.parse(template, safe, default)
         return val
 
     def quote(self, template):
@@ -60,7 +64,7 @@ class IOHandler:
         replacement = r"'{{ \1 }}'"
         return re.sub(pattern, replacement, template)
 
-    def parse(self, string):
+    def parse(self, string, safe=False, default=""):
         """Use AST module to parse 'call stack'-like string and return the result
 
         Example -
@@ -85,7 +89,7 @@ class IOHandler:
 
         # first render everything using chevron
         # inject the context
-        string = self._render(string)
+        string = self._render(string, safe, default)
 
         # Now, extract the token if exists -
         pattern = (
@@ -140,6 +144,8 @@ class IOHandler:
                                 # because the user can run any python code need to find a way to limit the functions that can be used
 
                                 # https://github.com/keephq/keep/issues/138
+                                import datetime
+
                                 from dateutil.tz import tzutc
 
                                 g = globals()
@@ -149,6 +155,7 @@ class IOHandler:
 
                                 # TODO: this is a hack to tzutc in the eval, should be more robust
                                 g["tzutc"] = tzutc
+                                g["datetime"] = datetime
                                 # finally, eval the expression
                                 _arg = eval(_arg, g)
                             except ValueError:
@@ -176,13 +183,24 @@ class IOHandler:
                 tree = ast.parse(token.encode("unicode_escape"))
         return _parse(self, tree)
 
-    def _render(self, key):
+    def _render(self, key, safe=False, default=""):
         # change [] to . for the key because thats what chevron uses
         _key = key.replace("[", ".").replace("]", "")
 
         context = self.context_manager.get_full_context()
-        rendered = chevron.render(_key, context)
-
+        # TODO: protect from multithreaded where another thread will print to stderr, but thats a very rare case and we shouldn't care much
+        original_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        rendered = chevron.render(_key, context, warn=True)
+        stderr_output = sys.stderr.getvalue()
+        sys.stderr = original_stderr
+        # If render should failed if value does not exists
+        if safe and "Could not find key" in stderr_output:
+            raise RenderException(
+                f"Could not find key {key} in context - {stderr_output}"
+            )
+        if not rendered:
+            return default
         return rendered
 
     def render_context(self, context_to_render: dict):
@@ -193,11 +211,18 @@ class IOHandler:
         context_to_render = copy.deepcopy(context_to_render)
         for key, value in context_to_render.items():
             if isinstance(value, str):
-                context_to_render[key] = self._render_template_with_context(value)
+                context_to_render[key] = self._render_template_with_context(
+                    value, safe=True
+                )
             elif isinstance(value, list):
                 context_to_render[key] = self._render_list_context(value)
             elif isinstance(value, dict):
                 context_to_render[key] = self.render_context(value)
+            elif isinstance(value, StepProviderParameter):
+                safe = value.safe and value.default is not None
+                context_to_render[key] = self._render_template_with_context(
+                    value.key, safe=safe, default=value.default
+                )
         return context_to_render
 
     def _render_list_context(self, context_to_render: list):
@@ -207,14 +232,18 @@ class IOHandler:
         for i in range(0, len(context_to_render)):
             value = context_to_render[i]
             if isinstance(value, str):
-                context_to_render[i] = self._render_template_with_context(value)
+                context_to_render[i] = self._render_template_with_context(
+                    value, safe=True
+                )
             if isinstance(value, list):
                 context_to_render[i] = self._render_list_context(value)
             if isinstance(value, dict):
                 context_to_render[i] = self.render_context(value)
         return context_to_render
 
-    def _render_template_with_context(self, template: str) -> str:
+    def _render_template_with_context(
+        self, template: str, safe: bool = False, default: str = ""
+    ) -> str:
         """
         Renders a template with the given context.
 
@@ -224,7 +253,7 @@ class IOHandler:
         Returns:
             str: rendered template
         """
-        rendered_template = self.render(template)
+        rendered_template = self.render(template, safe, default)
 
         # shorten urls if enabled
         if self.shorten_urls:
