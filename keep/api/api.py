@@ -18,7 +18,7 @@ from starlette_context.middleware import RawContextMiddleware
 import keep.api.logging
 import keep.api.observability
 from keep.api.core.config import AuthenticationType
-from keep.api.core.db import create_db_and_tables, get_user, try_create_single_tenant
+from keep.api.core.db import get_user
 from keep.api.core.dependencies import (
     SINGLE_TENANT_UUID,
     get_user_email,
@@ -32,7 +32,6 @@ from keep.api.core.dependencies import (
 )
 from keep.api.logging import CONFIG as logging_config
 from keep.api.routes import (
-    ai,
     alerts,
     healthcheck,
     providers,
@@ -113,7 +112,7 @@ class EventCaptureMiddleware(BaseHTTPMiddleware):
         await self.capture_response(request, response)
 
         # Perform async tasks or flush events after the request is handled
-        self.flush()
+        await self.flush()
         return response
 
 
@@ -144,7 +143,6 @@ def get_app(
     app.include_router(providers.router, prefix="/providers", tags=["providers"])
     app.include_router(healthcheck.router, prefix="/healthcheck", tags=["healthcheck"])
     app.include_router(tenant.router, prefix="/tenant", tags=["tenant"])
-    app.include_router(ai.router, prefix="/ai", tags=["ai"])
     app.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
     app.include_router(settings.router, prefix="/settings", tags=["settings"])
     app.include_router(
@@ -209,9 +207,6 @@ def get_app(
 
     @app.on_event("startup")
     async def on_startup():
-        if not os.environ.get("SKIP_DB_CREATION", "false") == "true":
-            create_db_and_tables()
-
         # When running in mode other than multi tenant auth, we want to override the secured endpoints
         if AUTH_TYPE != AuthenticationType.MULTI_TENANT.value:
             app.dependency_overrides[verify_api_key] = verify_api_key_single_tenant
@@ -222,7 +217,6 @@ def get_app(
             app.dependency_overrides[
                 verify_token_or_key
             ] = verify_token_or_key_single_tenant
-            try_create_single_tenant(SINGLE_TENANT_UUID)
 
         # load all providers into cache
         from keep.providers.providers_factory import ProvidersFactory
@@ -230,6 +224,13 @@ def get_app(
         logger.info("Loading providers into cache")
         ProvidersFactory.get_all_providers()
         logger.info("Providers loaded successfully")
+
+        # We want to start all internal services (workflowmanager, eventsubscriber, etc) only after the server is up
+        # so we init a thread that will wait for the server to be up and then start the internal services
+        # start the internal services
+        logger.info("Starting the run services thread")
+        thread = threading.Thread(target=run_services_after_app_is_up)
+        thread.start()
 
     @app.exception_handler(Exception)
     async def catch_exception(request: Request, exc: Exception):
@@ -253,13 +254,6 @@ def get_app(
         return response
 
     keep.api.observability.setup(app)
-
-    if os.environ.get("USE_NGROK", "false") == "true":
-        from pyngrok import ngrok
-
-        public_url = ngrok.connect(PORT).public_url
-        logger.info(f"ngrok tunnel: {public_url}")
-        os.environ["KEEP_API_URL"] = public_url
 
     return app
 
@@ -305,12 +299,12 @@ def _wait_for_server_to_be_ready():
 
 
 def run(app: FastAPI):
-    # We want to start all internal services (workflowmanager, eventsubscriber, etc) only after the server is up
-    # so we init a thread that will wait for the server to be up and then start the internal services
-    logger.info("Starting the run services thread")
-    thread = threading.Thread(target=run_services_after_app_is_up)
-    thread.start()
     logger.info("Starting the uvicorn server")
+    # call on starting to create the db and tables
+    import keep.api.config
+
+    keep.api.config.on_starting()
+
     # run the server
     uvicorn.run(
         app,
