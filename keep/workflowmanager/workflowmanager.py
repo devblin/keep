@@ -5,7 +5,11 @@ import typing
 import uuid
 
 from keep.api.core.config import AuthenticationType
-from keep.api.core.db import get_enrichment, save_workflow_results
+from keep.api.core.db import (
+    get_enrichment,
+    get_previous_alert_by_fingerprint,
+    save_workflow_results,
+)
 from keep.api.models.alert import AlertDto
 from keep.providers.providers_factory import ProviderConfigurationException
 from keep.workflowmanager.workflow import Workflow
@@ -43,7 +47,7 @@ class WorkflowManager:
         self.started = False
 
     def _apply_filter(self, filter_val, value):
-        # if its a regex, apply it
+        # if it's a regex, apply it
         if filter_val.startswith('r"'):
             try:
                 # remove the r" and the last "
@@ -71,7 +75,7 @@ class WorkflowManager:
                 # todo - handle it better
                 # todo2 - handle if more than one provider is not configured
                 except ProviderConfigurationException as e:
-                    self.logger.warn(
+                    self.logger.warning(
                         f"Workflow have a provider that is not configured: {e}"
                     )
                     continue
@@ -84,6 +88,7 @@ class WorkflowManager:
                     if not trigger.get("type") == "alert":
                         continue
                     should_run = True
+                    # apply filters
                     for filter in trigger.get("filters", []):
                         # TODO: more sophisticated filtering/attributes/nested, etc
                         filter_key = filter.get("key")
@@ -128,17 +133,49 @@ class WorkflowManager:
                             should_run = False
                             break
 
-                    # if we got here, it means the event should trigger the workflow
-                    if should_run:
-                        self.logger.info("Found a workflow to run")
-                        event.trigger = "alert"
-                        # prepare the alert with the enrichment
-                        self.logger.info("Enriching alert")
-                        alert_enrichment = get_enrichment(tenant_id, event.fingerprint)
-                        if alert_enrichment:
-                            for k, v in alert_enrichment.enrichments.items():
-                                setattr(event, k, v)
-                        self.logger.info("Alert enriched")
+                    if not should_run:
+                        continue
+                    # enrich the alert with more data
+                    self.logger.info("Found a workflow to run")
+                    event.trigger = "alert"
+                    # prepare the alert with the enrichment
+                    self.logger.info("Enriching alert")
+                    alert_enrichment = get_enrichment(tenant_id, event.fingerprint)
+                    if alert_enrichment:
+                        for k, v in alert_enrichment.enrichments.items():
+                            setattr(event, k, v)
+                    self.logger.info("Alert enriched")
+                    # apply only_on_change (https://github.com/keephq/keep/issues/801)
+                    fields_that_needs_to_be_change = trigger.get("only_on_change", [])
+                    # if there are fields that needs to be changed, get the previous alert
+                    if fields_that_needs_to_be_change:
+                        previous_alert = get_previous_alert_by_fingerprint(
+                            tenant_id, event.fingerprint
+                        )
+                        # now compare:
+                        #   (no previous alert means that the workflow should run)
+                        if previous_alert:
+                            for field in fields_that_needs_to_be_change:
+                                # the field hasn't change
+                                if getattr(event, field) == previous_alert.event.get(
+                                    field
+                                ):
+                                    self.logger.info(
+                                        "Skipping the workflow because the field hasn't change",
+                                        extra={
+                                            "field": field,
+                                            "event": event,
+                                            "previous_alert": previous_alert,
+                                        },
+                                    )
+                                    should_run = False
+                                    break
+
+                    if not should_run:
+                        continue
+                    # Lastly, if the workflow should run, add it to the scheduler
+                    self.logger.info("Adding workflow to run")
+                    with self.scheduler.lock:
                         self.scheduler.workflows_to_run.append(
                             {
                                 "workflow": workflow,
@@ -148,6 +185,7 @@ class WorkflowManager:
                                 "event": event,
                             }
                         )
+                    self.logger.info("Workflow added to run")
 
     def _get_event_value(self, event, filter_key):
         # if the filter key is a nested key, get the value
@@ -181,7 +219,7 @@ class WorkflowManager:
         # If at least one workflow has an interval, run workflows using the scheduler,
         #   otherwise, just run it
         if any([Workflow.workflow_interval for Workflow in workflows]):
-            # running workglows in scheduler mode
+            # running workflows in scheduler mode
             self.logger.info(
                 "Found at least one workflow with an interval, running in scheduler mode"
             )
@@ -219,7 +257,7 @@ class WorkflowManager:
                     )
 
     def _run_workflow(self, workflow: Workflow, workflow_execution_id: str):
-        self.logger.info(f"Running workflow {workflow.workflow_id}")
+        self.logger.debug(f"Running workflow {workflow.workflow_id}")
         errors = []
         try:
             self._check_premium_providers(workflow)
@@ -233,7 +271,7 @@ class WorkflowManager:
                 self.logger.info(
                     f"Running on_failure action for workflow {workflow.workflow_id}"
                 )
-                # Adding the exception message to the provider context so it'll be available for the action
+                # Adding the exception message to the provider context, so it'll be available for the action
                 message = (
                     f"Workflow {workflow.workflow_id} failed with exception: {str(e)}å"
                 )
@@ -264,6 +302,10 @@ class WorkflowManager:
         workflow_results = {
             action.name: action.provider.results for action in workflow.workflow_actions
         }
+        if workflow.workflow_steps:
+            workflow_results.update(
+                {step.name: step.provider.results for step in workflow.workflow_steps}
+            )
         try:
             save_workflow_results(
                 tenant_id=workflow.context_manager.tenant_id,

@@ -1,13 +1,12 @@
 import logging
 import os
-import threading
-import time
+from importlib import metadata
 
 import jwt
-import requests
 import uvicorn
 from dotenv import find_dotenv, load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from opentelemetry import trace
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -19,26 +18,21 @@ import keep.api.logging
 import keep.api.observability
 from keep.api.core.config import AuthenticationType
 from keep.api.core.db import get_user
-from keep.api.core.dependencies import (
-    SINGLE_TENANT_UUID,
-    get_user_email,
-    get_user_email_single_tenant,
-    verify_api_key,
-    verify_api_key_single_tenant,
-    verify_bearer_token,
-    verify_bearer_token_single_tenant,
-    verify_token_or_key,
-    verify_token_or_key_single_tenant,
-)
+from keep.api.core.dependencies import SINGLE_TENANT_UUID
 from keep.api.logging import CONFIG as logging_config
 from keep.api.routes import (
     alerts,
+    extraction,
+    groups,
     healthcheck,
+    mapping,
+    preset,
     providers,
     pusher,
+    rules,
     settings,
     status,
-    tenant,
+    users,
     whoami,
     workflows,
 )
@@ -55,6 +49,11 @@ PORT = int(os.environ.get("PORT", 8080))
 SCHEDULER = os.environ.get("SCHEDULER", "true") == "true"
 CONSUMER = os.environ.get("CONSUMER", "true") == "true"
 AUTH_TYPE = os.environ.get("AUTH_TYPE", AuthenticationType.NO_AUTH.value)
+try:
+    KEEP_VERSION = metadata.version("keep")
+except Exception:
+    KEEP_VERSION = os.environ.get("KEEP_VERSION", "unknown")
+POSTHOG_API_ENABLED = os.environ.get("ENABLE_POSTHOG_API", "false") == "true"
 
 
 class EventCaptureMiddleware(BaseHTTPMiddleware):
@@ -72,32 +71,40 @@ class EventCaptureMiddleware(BaseHTTPMiddleware):
             return "anonymous"
 
     async def capture_request(self, request: Request) -> None:
-        identity = self._extract_identity(request)
-        with self.tracer.start_as_current_span("capture_request"):
-            self.posthog_client.capture(
-                identity,
-                "request-started",
-                {"path": request.url.path, "method": request.method},
-            )
+        if POSTHOG_API_ENABLED:
+            identity = self._extract_identity(request)
+            with self.tracer.start_as_current_span("capture_request"):
+                self.posthog_client.capture(
+                    identity,
+                    "request-started",
+                    {
+                        "path": request.url.path,
+                        "method": request.method,
+                        "keep_version": KEEP_VERSION,
+                    },
+                )
 
     async def capture_response(self, request: Request, response: Response) -> None:
-        identity = self._extract_identity(request)
-        with self.tracer.start_as_current_span("capture_response"):
-            self.posthog_client.capture(
-                identity,
-                "request-finished",
-                {
-                    "path": request.url.path,
-                    "method": request.method,
-                    "status_code": response.status_code,
-                },
-            )
+        if POSTHOG_API_ENABLED:
+            identity = self._extract_identity(request)
+            with self.tracer.start_as_current_span("capture_response"):
+                self.posthog_client.capture(
+                    identity,
+                    "request-finished",
+                    {
+                        "path": request.url.path,
+                        "method": request.method,
+                        "status_code": response.status_code,
+                        "keep_version": KEEP_VERSION,
+                    },
+                )
 
     async def flush(self):
-        with self.tracer.start_as_current_span("flush_posthog_events"):
-            logger.info("Flushing Posthog events")
-            self.posthog_client.flush()
-            logger.info("Posthog events flushed")
+        if POSTHOG_API_ENABLED:
+            with self.tracer.start_as_current_span("flush_posthog_events"):
+                logger.info("Flushing Posthog events")
+                self.posthog_client.flush()
+                logger.info("Posthog events flushed")
 
     async def dispatch(self, request: Request, call_next):
         # Skip OPTIONS requests
@@ -130,6 +137,9 @@ def get_app(
     )
     app.add_middleware(RawContextMiddleware, plugins=(plugins.RequestIdPlugin(),))
     app.add_middleware(
+        GZipMiddleware, minimum_size=30 * 1024 * 1024
+    )  # Approximately 30 MiB, https://cloud.google.com/run/quotas
+    app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=True,
@@ -142,7 +152,6 @@ def get_app(
 
     app.include_router(providers.router, prefix="/providers", tags=["providers"])
     app.include_router(healthcheck.router, prefix="/healthcheck", tags=["healthcheck"])
-    app.include_router(tenant.router, prefix="/tenant", tags=["tenant"])
     app.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
     app.include_router(settings.router, prefix="/settings", tags=["settings"])
     app.include_router(
@@ -151,6 +160,16 @@ def get_app(
     app.include_router(whoami.router, prefix="/whoami", tags=["whoami"])
     app.include_router(pusher.router, prefix="/pusher", tags=["pusher"])
     app.include_router(status.router, prefix="/status", tags=["status"])
+    app.include_router(rules.router, prefix="/rules", tags=["rules"])
+    app.include_router(preset.router, prefix="/preset", tags=["preset"])
+    app.include_router(groups.router, prefix="/groups", tags=["groups"])
+    app.include_router(users.router, prefix="/users", tags=["users"])
+    app.include_router(
+        mapping.router, prefix="/mapping", tags=["enrichment", "mapping"]
+    )
+    app.include_router(
+        extraction.router, prefix="/extraction", tags=["enrichment", "extraction"]
+    )
 
     # if its single tenant with authentication, add signin endpoint
     logger.info(f"Starting Keep with authentication type: {AUTH_TYPE}")
@@ -170,11 +189,13 @@ def get_app(
             # generate a JWT secret
             jwt_secret = os.environ.get("KEEP_JWT_SECRET")
             if not jwt_secret:
+                logger.info("missing KEEP_JWT_SECRET environment variable")
                 raise HTTPException(status_code=401, detail="Missing JWT secret")
             token = jwt.encode(
                 {
                     "email": user.username,
                     "tenant_id": SINGLE_TENANT_UUID,
+                    "role": user.role,
                 },
                 jwt_secret,
                 algorithm="HS256",
@@ -184,53 +205,35 @@ def get_app(
                 "accessToken": token,
                 "tenantId": SINGLE_TENANT_UUID,
                 "email": user.username,
+                "role": user.role,
             }
-
-    from fastapi import BackgroundTasks
-
-    @app.post("/start-services")
-    async def start_services(background_tasks: BackgroundTasks):
-        logger.info("Starting the internal services")
-        if SCHEDULER:
-            logger.info("Starting the scheduler")
-            wf_manager = WorkflowManager.get_instance()
-            background_tasks.add_task(wf_manager.start)
-            logger.info("Scheduler started successfully")
-
-        if CONSUMER:
-            logger.info("Starting the consumer")
-            event_subscriber = EventSubscriber.get_instance()
-            background_tasks.add_task(event_subscriber.start)
-            logger.info("Consumer started successfully")
-
-        return {"status": "Services are starting in the background"}
 
     @app.on_event("startup")
     async def on_startup():
-        # When running in mode other than multi tenant auth, we want to override the secured endpoints
-        if AUTH_TYPE != AuthenticationType.MULTI_TENANT.value:
-            app.dependency_overrides[verify_api_key] = verify_api_key_single_tenant
-            app.dependency_overrides[
-                verify_bearer_token
-            ] = verify_bearer_token_single_tenant
-            app.dependency_overrides[get_user_email] = get_user_email_single_tenant
-            app.dependency_overrides[
-                verify_token_or_key
-            ] = verify_token_or_key_single_tenant
-
         # load all providers into cache
         from keep.providers.providers_factory import ProvidersFactory
 
         logger.info("Loading providers into cache")
         ProvidersFactory.get_all_providers()
         logger.info("Providers loaded successfully")
-
-        # We want to start all internal services (workflowmanager, eventsubscriber, etc) only after the server is up
-        # so we init a thread that will wait for the server to be up and then start the internal services
-        # start the internal services
-        logger.info("Starting the run services thread")
-        thread = threading.Thread(target=run_services_after_app_is_up)
-        thread.start()
+        # Start the services
+        logger.info("Starting the services")
+        # Start the scheduler
+        if SCHEDULER:
+            logger.info("Starting the scheduler")
+            wf_manager = WorkflowManager.get_instance()
+            await wf_manager.start()
+            logger.info("Scheduler started successfully")
+        # Start the consumer
+        if CONSUMER:
+            logger.info("Starting the consumer")
+            event_subscriber = EventSubscriber.get_instance()
+            # TODO: there is some "race condition" since if the consumer starts before the server,
+            #       and start getting events, it will fail since the server is not ready yet
+            #       we should add a "wait" here to make sure the server is ready
+            await event_subscriber.start()
+            logger.info("Consumer started successfully")
+        logger.info("Services started successfully")
 
     @app.exception_handler(Exception)
     async def catch_exception(request: Request, exc: Exception):
@@ -250,52 +253,14 @@ def get_app(
     async def log_middeware(request: Request, call_next):
         logger.info(f"Request started: {request.method} {request.url.path}")
         response = await call_next(request)
-        logger.info(f"Request finished: {request.method} {request.url.path}")
+        logger.info(
+            f"Request finished: {request.method} {request.url.path} {response.status_code}"
+        )
         return response
 
     keep.api.observability.setup(app)
 
     return app
-
-
-def run_services_after_app_is_up():
-    """Waits until the server is up and than invoking the 'start-services' endpoint to start the internal services"""
-    logger.info("Waiting for the server to be ready")
-    _wait_for_server_to_be_ready()
-    logger.info("Server is ready, starting the internal services")
-    # start the internal services
-    try:
-        # the internal services are always on localhost
-        response = requests.post(f"http://localhost:{PORT}/start-services")
-        response.raise_for_status()
-        logger.info("Internal services started successfully")
-    except Exception as e:
-        logger.info("Failed to start internal services")
-        raise e
-
-
-def _is_server_ready() -> bool:
-    # poll localhost to see if the server is up
-    try:
-        # we are using hardcoded "localhost" to avoid problems where we start Keep on platform such as CloudRun where we have more than one instance
-        response = requests.get(f"http://localhost:{PORT}/healthcheck", timeout=1)
-        response.raise_for_status()
-        return True
-    except Exception:
-        return False
-
-
-def _wait_for_server_to_be_ready():
-    """Wait until the server is up by polling localhost"""
-    start_time = time.time()
-    while True:
-        if _is_server_ready():
-            return True
-        if time.time() - start_time >= 60:
-            raise TimeoutError("Server is not ready after 60 seconds.")
-        else:
-            logger.warning("Server is not ready yet, retrying in 1 second...")
-        time.sleep(1)
 
 
 def run(app: FastAPI):

@@ -35,6 +35,7 @@ class WorkflowDTO(BaseModel):
     workflow_raw: str
     revision: int = 1
     last_updated: datetime = None
+    invalid: bool = False  # whether the workflow is invalid or not (for UI purposes)
 
     @property
     def workflow_raw_id(self):
@@ -79,6 +80,14 @@ class WorkflowExecutionLogsDTO(BaseModel):
     timestamp: datetime
     message: str
     context: Optional[dict]
+
+
+class WorkflowToAlertExecutionDTO(BaseModel):
+    workflow_id: str
+    workflow_execution_id: str
+    alert_fingerprint: str
+    workflow_status: str
+    workflow_started: datetime
 
 
 class WorkflowExecutionDTO(BaseModel):

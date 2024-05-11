@@ -25,14 +25,11 @@ const nextConfig = {
       }
     ],
   },
-  experimental: {
-    serverComponentsExternalPackages: ["@tremor/react"],
-  },
   compiler: {
     removeConsole:
       process.env.NODE_ENV === "production"
         ? {
-            exclude: ["error"],
+           exclude: ["error"],
           }
         : false,
   },
@@ -46,17 +43,7 @@ const nextConfig = {
         permanent: true,
       },
     ];
-  },
-  rewrites: async () => {
-    return {
-      beforeFiles: [
-        {
-          source: "/backend/:slug*",
-          destination: process.env.API_URL + "/:slug*",
-        },
-      ],
-    };
-  },
+  }
 };
 
 module.exports = nextConfig;

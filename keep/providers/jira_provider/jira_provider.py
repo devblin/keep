@@ -1,7 +1,8 @@
 """
-JiraProvider is a class that implements the BaseProvider interface for Jira updates.
+JiracloudProvider is a class that implements the BaseProvider interface for Jira updates.
 """
 import dataclasses
+import json
 from typing import List
 from urllib.parse import urlencode, urljoin
 
@@ -17,7 +18,7 @@ from keep.providers.models.provider_config import ProviderConfig, ProviderScope
 
 @pydantic.dataclasses.dataclass
 class JiraProviderAuthConfig:
-    """Jira authentication configuration."""
+    """Jira Cloud authentication configuration."""
 
     email: str = dataclasses.field(
         metadata={
@@ -89,6 +90,7 @@ class JiraProvider(BaseProvider):
         ),
     ]
     PROVIDER_TAGS = ["ticketing"]
+    PROVIDER_DISPLAY_NAME = "Jira Cloud"
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
@@ -110,6 +112,7 @@ class JiraProvider(BaseProvider):
             f"{self.jira_host}/rest/api/3/myself",
             headers={"Accept": "application/json"},
             auth=auth,
+            verify=False,
         )
         try:
             resp.raise_for_status()
@@ -130,6 +133,7 @@ class JiraProvider(BaseProvider):
             headers=headers,
             auth=auth,
             params=params,
+            verify=False,
         )
         try:
             resp.raise_for_status()
@@ -208,7 +212,7 @@ class JiraProvider(BaseProvider):
                 query_params={"projectKeys": project_key},
             )
 
-            response = requests.get(url=url, auth=self.__get_auth())
+            response = requests.get(url=url, auth=self.__get_auth(), verify=False)
 
             response.raise_for_status()
 
@@ -250,6 +254,9 @@ class JiraProvider(BaseProvider):
         summary: str,
         description: str = "",
         issue_type: str = "",
+        labels: List[str] = None,
+        components: List[str] = None,
+        custom_fields: dict = None,
         **kwargs: dict,
     ):
         """
@@ -264,16 +271,27 @@ class JiraProvider(BaseProvider):
 
             url = self.__get_url(paths=["issue"])
 
-            request_body = {
-                "fields": {
-                    "summary": summary,
-                    "description": description,
-                    "project": {"key": project_key},
-                    "issuetype": {"name": issue_type},
-                }
+            fields = {
+                "summary": summary,
+                "description": description,
+                "project": {"key": project_key},
+                "issuetype": {"name": issue_type},
             }
 
-            response = requests.post(url=url, json=request_body, auth=self.__get_auth())
+            if labels:
+                fields["labels"] = labels
+
+            if components:
+                fields["components"] = [{"name": component} for component in components]
+
+            if custom_fields:
+                fields.update(custom_fields)
+
+            request_body = {"fields": fields}
+
+            response = requests.post(
+                url=url, json=request_body, auth=self.__get_auth(), verify=False
+            )
             try:
                 response.raise_for_status()
             except Exception:
@@ -292,6 +310,7 @@ class JiraProvider(BaseProvider):
             f"{self.jira_host}/rest/agile/1.0/board",
             auth=self.__get_auth(),
             headers={"Accept": "application/json"},
+            verify=False,
         )
         if boards_response.status_code == 200:
             boards = boards_response.json()["values"]
@@ -312,25 +331,29 @@ class JiraProvider(BaseProvider):
 
     def _notify(
         self,
+        summary: str,
+        description: str = "",
+        issue_type: str = "",
+        project_key: str = "",
+        board_name: str = "",
+        labels: List[str] = None,
+        components: List[str] = None,
+        custom_fields: dict = None,
         **kwargs: dict,
     ):
         """
         Notify jira by creating an issue.
         """
-        # extracrt the required params
-        project_key = kwargs.get("project_key", "")
         # if the user didn't provider a project_key, try to extract it from the board name
         if not project_key:
-            board_name = kwargs.get("board_name", "")
             project_key = self._extract_project_key_from_board_name(board_name)
-        summary = kwargs.get("summary", "")
-        description = kwargs.get("description", "")
-        issue_type = kwargs.get("issuetype", "")
-
+        issue_type = issue_type if issue_type else kwargs.get("issuetype", "Task")
         if not project_key or not summary or not issue_type or not description:
             raise ProviderException(
                 f"Project key and summary are required! - {project_key}, {summary}, {issue_type}, {description}"
             )
+        if labels and isinstance(labels, str):
+            labels = json.loads(labels.replace("'", '"'))
         try:
             self.logger.info("Notifying jira...")
             result = self.__create_issue(
@@ -338,6 +361,10 @@ class JiraProvider(BaseProvider):
                 summary=summary,
                 description=description,
                 issue_type=issue_type,
+                labels=labels,
+                components=components,
+                custom_fields=custom_fields,
+                **kwargs,
             )
             result["ticket_url"] = f"{self.jira_host}/browse/{result['issue']['key']}"
             self.logger.info("Notified jira!")
@@ -352,7 +379,7 @@ class JiraProvider(BaseProvider):
             }
             raise ProviderException(f"Failed to notify jira: {e} - Params: {context}")
 
-    def _query(self, board_id="", **kwargs: dict):
+    def _query(self, ticket_id="", board_id="", **kwargs: dict):
         """
         API for fetching issues:
         https://developer.atlassian.com/cloud/jira/software/rest/api-group-board/#api-rest-agile-1-0-board-boardid-issue-get
@@ -360,18 +387,26 @@ class JiraProvider(BaseProvider):
         Args:
             kwargs (dict): The providers with context
         """
-        self.logger.debug("Fetching data from Jira")
-
-        request_url = f"https://{self.jira_host}/rest/agile/1.0/board/{board_id}/issue"
-        response = requests.get(request_url, auth=self.__get_auth())
-        if not response.ok:
-            raise ProviderException(
-                f"{self.__class__.__name__} failed to fetch data from Jira: {response.text}"
+        if not ticket_id:
+            request_url = (
+                f"https://{self.jira_host}/rest/agile/1.0/board/{board_id}/issue"
             )
-        self.logger.debug("Fetched data from Jira")
-
-        issues = response.json()
-        return {"number_of_issues": issues["total"]}
+            response = requests.get(request_url, auth=self.__get_auth(), verify=False)
+            if not response.ok:
+                raise ProviderException(
+                    f"{self.__class__.__name__} failed to fetch data from Jira: {response.text}"
+                )
+            issues = response.json()
+            return {"number_of_issues": issues["total"]}
+        else:
+            request_url = self.__get_url(paths=["issue", ticket_id])
+            response = requests.get(request_url, auth=self.__get_auth(), verify=False)
+            if not response.ok:
+                raise ProviderException(
+                    f"{self.__class__.__name__} failed to fetch data from Jira: {response.text}"
+                )
+            issue = response.json()
+            return {"issue": issue}
 
 
 if __name__ == "__main__":

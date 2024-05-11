@@ -1,3 +1,4 @@
+import { ReactNode } from "react";
 import { NextAuthProvider } from "./auth-provider";
 import ErrorBoundary from "./error-boundary";
 import { Intercom } from "@/components/ui/Intercom";
@@ -12,30 +13,40 @@ const mulish = Mulish({
   display: "swap",
 });
 
-import Nav from "./nav";
 import { ToastContainer } from "react-toastify";
+import Navbar from "components/navbar/Navbar";
 
-export default async function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+type RootLayoutProps = {
+  children: ReactNode;
+};
+
+export default async function RootLayout({ children }: RootLayoutProps) {
   return (
-    <html
-      lang="en"
-      className={`h-full bg-gray-50 ${mulish.className}`}
-      suppressHydrationWarning={true}
-    >
-      <body className="h-full">
+    <html lang="en" className={`bg-gray-50 ${mulish.className}`}>
+      <body className="h-screen flex flex-col lg:grid lg:grid-cols-[fit-content(250px)_30px_auto] lg:grid-rows-1 lg:has-[aside[data-minimized='true']]:grid-cols-[0px_30px_auto]">
         <NextAuthProvider>
-          {/* @ts-expect-error Server Component */}
-          <Nav />
+          {/* @ts-ignore-error Server Component */}
+          <Navbar />
           {/* https://discord.com/channels/752553802359505017/1068089513253019688/1117731746922893333 */}
-          <ErrorBoundary>{children}</ErrorBoundary>
+          <main className="flex flex-col col-start-3 p-4 overflow-auto">
+            <div className="flex-1 h-0">
+              <ErrorBoundary>{children}</ErrorBoundary>
+            </div>
+            <ToastContainer />
+          </main>
         </NextAuthProvider>
-        <ToastContainer />
+
+        {/** footer */}
+        {process.env.GIT_COMMIT_HASH ? (
+          <div className="fixed right-2.5 bottom-2.5 text-gray-500 text-sm">
+            Build: {process.env.GIT_COMMIT_HASH}
+            <br />
+            Version: {process.env.KEEP_VERSION}
+          </div>
+        ) : (
+          <Intercom />
+        )}
       </body>
-      <Intercom />
     </html>
   );
 }

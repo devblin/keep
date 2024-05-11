@@ -1,14 +1,24 @@
 """
 The providers factory module.
 """
+
+import copy
+import datetime
 import importlib
 import inspect
+import json
 import logging
 import os
+import types
+import typing
 from dataclasses import fields
 from typing import get_args
 
-from keep.api.core.db import get_consumer_providers, get_installed_providers
+from keep.api.core.db import (
+    get_consumer_providers,
+    get_installed_providers,
+    get_linked_providers,
+)
 from keep.api.models.provider import Provider
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
@@ -72,11 +82,10 @@ class ProvidersFactory:
             BaseProvider: The provider class.
         """
         provider_class = ProvidersFactory.get_provider_class(provider_type)
-        # backward compatibility issues
-        # when providers.yaml could have 'type' too
-        if "type" in provider_config:
-            del provider_config["type"]
-        provider_config = ProviderConfig(**provider_config)
+        # we keep a copy of the auth config so we can check if the provider has changed it and we need to update it
+        #   an example for that is the Datadog provider that uses OAuth and needs to save the fresh new refresh token.
+        provider_config_copy = copy.deepcopy(provider_config)
+        provider_config: ProviderConfig = ProviderConfig(**provider_config)
 
         try:
             provider = provider_class(
@@ -91,6 +100,20 @@ class ProvidersFactory:
             raise ProviderConfigurationException(exc)
         except Exception as exc:
             raise exc
+        finally:
+            # if the provider has changed the auth config, we need to update it, even if the provider failed to initialize
+            if (
+                provider_config_copy.get("authentication")
+                != provider_config.authentication
+            ):
+                provider_config_copy["authentication"] = provider_config.authentication
+                secret_manager = SecretManagerFactory.get_secret_manager(
+                    context_manager
+                )
+                secret_manager.write_secret(
+                    secret_name=f"{context_manager.tenant_id}_{provider_type}_{provider_id}",
+                    secret_value=json.dumps(provider_config_copy),
+                )
 
     @staticmethod
     def get_provider_required_config(provider_type: str) -> dict:
@@ -121,6 +144,45 @@ class ProvidersFactory:
             )
             return {}
 
+    def _get_method_param_type(param: inspect.Parameter) -> str:
+        """
+        Get the type name from a function parameter annotation.
+        Handles generic types like Union by returning the first non-NoneType arg.
+        Falls back to 'str' if it can't determine the type.
+
+        Args:
+            param (inspect.Parameter): The parameter to get the type from.
+
+        Returns:
+            str: The type name.
+
+        """
+        annotation_type = param.annotation
+        if annotation_type is inspect.Parameter.empty:
+            # if no annotation, defaults to str
+            return "str"
+
+        if isinstance(annotation_type, type):
+            # it's a simple type
+            return annotation_type.__name__
+
+        annotation_type_origin = typing.get_origin(annotation_type)
+        annotation_type_args = typing.get_args(annotation_type)
+        if annotation_type_args and annotation_type_origin in [
+            typing.Union,
+            types.UnionType,
+        ]:
+            # get the first annotation type argument which type is not NoneType
+            arg_type = next(
+                item.__name__
+                for item in annotation_type_args
+                if item.__name__ != "NoneType"
+            )
+            return arg_type
+        else:
+            # otherwise fallback to str
+            return "str"
+
     def __get_methods(provider_class: BaseProvider) -> list[ProviderMethodDTO]:
         methods = []
         for method in provider_class.PROVIDER_METHODS:
@@ -142,7 +204,7 @@ class ProvidersFactory:
                 func_params.append(
                     ProviderMethodParam(
                         name=param,
-                        type=params[param].annotation.__name__,
+                        type=ProvidersFactory._get_method_param_type(params[param]),
                         mandatory=mandatory,
                         default=default,
                         expected_values=expected_values,
@@ -205,7 +267,6 @@ class ProvidersFactory:
                 )
                 supports_webhook = (
                     issubclass(provider_class, BaseProvider)
-                    and provider_class.__dict__.get("format_alert") is not None
                     and provider_class.__dict__.get("webhook_template") is not None
                 )
                 can_notify = (
@@ -266,9 +327,16 @@ class ProvidersFactory:
                     provider_tags.append("messaging")
 
                 provider_methods = ProvidersFactory.__get_methods(provider_class)
+                # if the provider has a PROVIDER_DISPLAY_NAME, use it, otherwise use the provider type
+                provider_display_name = getattr(
+                    provider_class,
+                    "PROVIDER_DISPLAY_NAME",
+                    provider_type,
+                )
                 providers.append(
                     Provider(
                         type=provider_type,
+                        display_name=provider_display_name,
                         config=config,
                         can_notify=can_notify,
                         can_query=can_query,
@@ -348,19 +416,10 @@ class ProvidersFactory:
         initialized_consumer_providers = []
         for provider in installed_consumer_providers:
             try:
-                context_manager = ContextManager(tenant_id=provider.tenant_id)
-                secret_manager = SecretManagerFactory.get_secret_manager(
-                    context_manager
-                )
-                provider_config = secret_manager.read_secret(
-                    secret_name=f"{provider.tenant_id}_{provider.type}_{provider.id}",
-                    is_json=True,
-                )
-                provider_class = ProvidersFactory.get_provider(
-                    context_manager=context_manager,
+                provider_class = ProvidersFactory.get_installed_provider(
+                    tenant_id=provider.tenant_id,
                     provider_id=provider.id,
                     provider_type=provider.type,
-                    provider_config=provider_config,
                 )
                 initialized_consumer_providers.append(provider_class)
             except Exception:
@@ -369,3 +428,76 @@ class ProvidersFactory:
                 )
                 continue
         return initialized_consumer_providers
+
+    @staticmethod
+    def get_installed_provider(
+        tenant_id: str, provider_id: str, provider_type: str
+    ) -> BaseProvider:
+        """
+        Get the instantiated provider class according to the provider type.
+
+        Args:
+            tenant_id (str): The tenant id.
+            provider_id (str): The provider id.
+            provider_type (str): The provider type.
+
+        Returns:
+            BaseProvider: The instantiated provider class.
+        """
+        context_manager = ContextManager(tenant_id=tenant_id)
+        secret_manager = SecretManagerFactory.get_secret_manager(context_manager)
+        provider_config = secret_manager.read_secret(
+            secret_name=f"{tenant_id}_{provider_type}_{provider_id}",
+            is_json=True,
+        )
+        provider_class = ProvidersFactory.get_provider(
+            context_manager=context_manager,
+            provider_id=provider_id,
+            provider_type=provider_type,
+            provider_config=provider_config,
+        )
+        return provider_class
+
+    @staticmethod
+    def get_linked_providers(tenant_id: str) -> list[Provider]:
+        """
+        Get the linked providers.
+
+        Args:
+            tenant_id (str): The tenant id.
+
+        Returns:
+            list: The linked providers.
+        """
+        linked_providers = get_linked_providers(tenant_id)
+        available_providers = ProvidersFactory.get_all_providers()
+
+        _linked_providers = []
+        for p in linked_providers:
+            provider_type, provider_id, last_alert_received = p[0], p[1], p[2]
+            provider: Provider = next(
+                filter(
+                    lambda provider: provider.type == provider_type,
+                    available_providers,
+                ),
+                None,
+            )
+            if not provider:
+                # It means it's a custom provider
+                provider = Provider(
+                    display_name=provider_type,
+                    type=provider_type,
+                    can_notify=False,
+                    can_query=False,
+                    tags=["alert"],
+                )
+            provider = provider.copy()
+            provider.linked = True
+            provider.id = provider_id
+            if last_alert_received:
+                provider.last_alert_received = last_alert_received.replace(
+                    tzinfo=datetime.timezone.utc
+                ).isoformat()
+            _linked_providers.append(provider)
+
+        return _linked_providers

@@ -51,22 +51,25 @@ class MattermostProvider(BaseProvider):
         Args:
             kwargs (dict): The providers with context
         """
-        self.logger.debug("Notifying alert message to Mattermost")
+        self.logger.info("Notifying alert message to Mattermost")
         if not message:
             message = blocks[0].get("text")
         webhook_url = self.authentication_config.webhook_url
         payload = {"text": message, "blocks": blocks}
-        if channel:
-            payload["channel"] = channel
+        # channel is currently bugged (and unnecessary, as a webhook url is already one per channel) and so it is ignored for now
+        #if channel:
+        #    payload["channel"] = channel
 
-        response = requests.post(webhook_url, json=payload)
+        response = requests.post(webhook_url, json=payload, verify=False)
 
         if not response.ok:
             raise ProviderException(
                 f"{self.__class__.__name__} failed to notify alert message to Mattermost: {response.text}"
             )
 
-        self.logger.debug("Alert message notified to Mattermost")
+        self.logger.info(
+            "Alert message notified to Mattermost", extra={"response": response.text}
+        )
 
 
 if __name__ == "__main__":

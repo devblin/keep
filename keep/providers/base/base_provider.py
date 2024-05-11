@@ -1,11 +1,15 @@
 """
 Base class for all providers.
 """
+
 import abc
 import copy
 import datetime
 import hashlib
+import itertools
 import json
+import logging
+import operator
 import os
 import re
 import uuid
@@ -14,8 +18,9 @@ from typing import Literal, Optional
 import opentelemetry.trace as trace
 import requests
 
-from keep.api.core.db import enrich_alert
-from keep.api.models.alert import AlertDto
+from keep.api.core.db import enrich_alert, get_enrichments
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
+from keep.api.utils.enrichment_helpers import parse_and_enrich_deleted_and_assignees
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
 from keep.providers.models.provider_method import ProviderMethod
@@ -39,6 +44,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
         config: ProviderConfig,
         webhooke_template: Optional[str] = None,
         webhook_description: Optional[str] = None,
+        webhook_markdown: Optional[str] = None,
         provider_description: Optional[str] = None,
     ):
         """
@@ -53,6 +59,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
         self.config = config
         self.webhooke_template = webhooke_template
         self.webhook_description = webhook_description
+        self.webhook_markdown = webhook_markdown
         self.provider_description = provider_description
         self.context_manager = context_manager
         self.logger = context_manager.get_logger()
@@ -114,16 +121,28 @@ class BaseProvider(metaclass=abc.ABCMeta):
         self.results.append(results)
         # if the alert should be enriched, enrich it
         enrich_alert = kwargs.get("enrich_alert", [])
-        if not enrich_alert:
-            return results
+        if not enrich_alert or results is None:
+            return results if results else None
 
-        if not results:
-            return
+        self._enrich_alert(enrich_alert, results)
+        return results
 
-        # Now try to enrich the alert
+    def _enrich_alert(self, enrichments, results):
+        """
+        Enrich alert with provider specific data.
+
+        """
         self.logger.debug("Extracting the fingerprint from the alert")
         if "fingerprint" in results:
             fingerprint = results["fingerprint"]
+        elif self.context_manager.foreach_context.get("value", {}):
+            foreach_context: dict | tuple = self.context_manager.foreach_context.get(
+                "value", {}
+            )
+            if isinstance(foreach_context, tuple):
+                # This is when we are in a foreach context that is zipped
+                foreach_context: dict = foreach_context[0]
+            fingerprint = foreach_context.get("fingerprint")
         # else, if we are in an event context, use the event fingerprint
         elif self.context_manager.event_context:
             # TODO: map all casses event_context is dict and update them to the DTO
@@ -143,14 +162,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
             )
             raise Exception("No fingerprint found for alert enrichment")
         self.logger.debug("Fingerprint extracted", extra={"fingerprint": fingerprint})
-        self._enrich_alert(fingerprint, enrich_alert, results)
-        return results
 
-    def _enrich_alert(self, fingerprint, enrichments, results):
-        """
-        Enrich alert with provider specific data.
-
-        """
         _enrichments = {}
         # enrich only the requested fields
         for enrichment in enrichments:
@@ -205,17 +217,49 @@ class BaseProvider(metaclass=abc.ABCMeta):
     def query(self, **kwargs: dict):
         # just run the query
         results = self._query(**kwargs)
+        self.results.append(results)
         # now add the type of the results to the global context
         if results and isinstance(results, list):
             self.context_manager.dependencies.add(results[0].__class__)
         elif results:
             self.context_manager.dependencies.add(results.__class__)
+
+        enrich_alert = kwargs.get("enrich_alert", [])
+        if enrich_alert:
+            self._enrich_alert(enrich_alert, results)
         # and return the results
         return results
 
     @staticmethod
-    def format_alert(event: dict) -> AlertDto | list[AlertDto]:
+    def _format_alert(
+        event: dict, provider_instance: Optional["BaseProvider"] = None
+    ) -> AlertDto | list[AlertDto]:
+        """
+        Format an incoming alert.
+
+        Args:
+            event (dict): The raw provider event payload.
+            provider_instance (Optional[&quot;BaseProvider&quot;]): The tenant provider instance if it was successfully loaded.
+
+        Raises:
+            NotImplementedError: For providers who does not implement this method.
+
+        Returns:
+            AlertDto | list[AlertDto]: The formatted alert(s).
+        """
         raise NotImplementedError("format_alert() method not implemented")
+
+    @classmethod
+    def format_alert(
+        cls,
+        event: dict,
+        provider_instance: Optional["BaseProvider"],
+    ) -> AlertDto | list[AlertDto]:
+        logger = logging.getLogger(__name__)
+        logger.debug("Formatting alert")
+        formatted_alert = cls._format_alert(event, provider_instance)
+        logger.debug("Alert formatted")
+        return formatted_alert
 
     @staticmethod
     def get_alert_fingerprint(alert: AlertDto, fingerprint_fields: list = []) -> str:
@@ -261,18 +305,73 @@ class BaseProvider(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError("deploy_alert() method not implemented")
 
-    def _get_alerts(self):
+    def _get_alerts(self) -> list[AlertDto]:
         """
         Get alerts from the provider.
         """
         raise NotImplementedError("get_alerts() method not implemented")
 
-    def get_alerts(self):
+    def get_alerts(self) -> list[AlertDto]:
         """
         Get alerts from the provider.
         """
         with tracer.start_as_current_span(f"{self.__class__.__name__}-get_alerts"):
-            return self._get_alerts()
+            alerts = self._get_alerts()
+            # enrich alerts with provider id
+            for alert in alerts:
+                alert.providerId = self.provider_id
+            return alerts
+
+    def get_alerts_by_fingerprint(self, tenant_id: str) -> dict[str, list[AlertDto]]:
+        """
+        Get alerts from the provider grouped by fingerprint, sorted by lastReceived.
+
+        Returns:
+            dict[str, list[AlertDto]]: A dict of alerts grouped by fingerprint, sorted by lastReceived.
+        """
+        alerts = self.get_alerts()
+
+        if not alerts:
+            return {}
+
+        # get alerts, group by fingerprint and sort them by lastReceived
+        with tracer.start_as_current_span(f"{self.__class__.__name__}-get_last_alerts"):
+            get_attr = operator.attrgetter("fingerprint")
+            grouped_alerts = {
+                fingerprint: list(alerts)
+                for fingerprint, alerts in itertools.groupby(
+                    sorted(
+                        alerts,
+                        key=get_attr,
+                    ),
+                    get_attr,
+                )
+            }
+
+        # enrich alerts
+        with tracer.start_as_current_span(f"{self.__class__.__name__}-enrich_alerts"):
+            pulled_alerts_enrichments = get_enrichments(
+                tenant_id=tenant_id,
+                fingerprints=grouped_alerts.keys(),
+            )
+            for alert_enrichment in pulled_alerts_enrichments:
+                if alert_enrichment:
+                    alerts_to_enrich = grouped_alerts.get(
+                        alert_enrichment.alert_fingerprint
+                    )
+                    for alert_to_enrich in alerts_to_enrich:
+                        parse_and_enrich_deleted_and_assignees(
+                            alert_to_enrich, alert_enrichment.enrichments
+                        )
+                        for enrichment in alert_enrichment.enrichments:
+                            # set the enrichment
+                            setattr(
+                                alert_to_enrich,
+                                enrichment,
+                                alert_enrichment.enrichments[enrichment],
+                            )
+
+        return grouped_alerts
 
     def setup_webhook(
         self, tenant_id: str, keep_api_url: str, api_key: str, setup_alerts: bool = True
@@ -416,7 +515,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
         alert_model = AlertDto(
             id=alert_data.get("id", str(uuid.uuid4())),
             name=alert_data.get("name", "alert-from-event-queue"),
-            status=alert_data.get("status", "alert-from-event-queue"),
+            status=alert_data.get("status", AlertStatus.FIRING),
             lastReceived=alert_data.get("lastReceived", datetime.datetime.now()),
             environment=alert_data.get("environment", "alert-from-event-queue"),
             isDuplicate=alert_data.get("isDuplicate", False),
@@ -425,8 +524,7 @@ class BaseProvider(metaclass=abc.ABCMeta):
             source=alert_data.get("source", [self.provider_type]),
             message=alert_data.get("message", "alert-from-event-queue"),
             description=alert_data.get("description", "alert-from-event-queue"),
-            severity=alert_data.get("severity", "alert-from-event-queue"),
-            fatigueMeter=alert_data.get("fatigueMeter", 0),
+            severity=alert_data.get("severity", AlertSeverity.INFO),
             pushed=alert_data.get("pushed", False),
             event_id=alert_data.get("event_id", str(uuid.uuid4())),
             url=alert_data.get("url", None),
@@ -447,3 +545,22 @@ class BaseProvider(metaclass=abc.ABCMeta):
             self.logger.error(
                 f"Failed to push alert to {self.provider_id}: {response.content}"
             )
+
+    @classmethod
+    def simulate_alert(cls) -> dict:
+        # can be overridden by the provider
+        import importlib
+        import random
+
+        module_path = ".".join(cls.__module__.split(".")[0:-1]) + ".alerts_mock"
+        module = importlib.import_module(module_path)
+
+        ALERTS = getattr(module, "ALERTS", None)
+
+        alert_type = random.choice(list(ALERTS.keys()))
+        alert_data = ALERTS[alert_type]
+
+        # Start with the base payload
+        simulated_alert = alert_data["payload"].copy()
+
+        return simulated_alert

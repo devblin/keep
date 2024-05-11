@@ -1,18 +1,19 @@
 """
 Kibana provider.
 """
+
 import dataclasses
 import datetime
 import json
 import uuid
-from typing import Literal
+from typing import Literal, Optional
 from urllib.parse import urlparse
 
 import pydantic
 import requests
 from fastapi import HTTPException
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.models.provider_config import ProviderConfig, ProviderScope
@@ -129,6 +130,14 @@ class KibanaProvider(BaseProvider):
             alias="Write Connectors",
         ),
     ]
+
+    SEVERITIES_MAP = {}
+
+    STATUS_MAP = {
+        "active": AlertStatus.FIRING,
+        "Alert": AlertStatus.FIRING,
+        "recovered": AlertStatus.RESOLVED,
+    }
 
     def __init__(
         self, context_manager: ContextManager, provider_id: str, config: ProviderConfig
@@ -304,11 +313,15 @@ class KibanaProvider(BaseProvider):
             for status in ["Alert", "Recovered", "No Data"]:
                 alert_actions.append(
                     {
-                        "group": "custom_threshold.fired"
-                        if status == "Alert"
-                        else "recovered"
-                        if status == "Recovered"
-                        else "custom_threshold.nodata",
+                        "group": (
+                            "custom_threshold.fired"
+                            if status == "Alert"
+                            else (
+                                "recovered"
+                                if status == "Recovered"
+                                else "custom_threshold.nodata"
+                            )
+                        ),
                         "id": connector_id,
                         "params": {"body": KibanaProvider.WEBHOOK_PAYLOAD},
                         "frequency": {
@@ -439,19 +452,28 @@ class KibanaProvider(BaseProvider):
             "triggered_time",
             datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
         )
-        status = event.pop("status", "Alert")
+        # map status to keep status
+        status = KibanaProvider.STATUS_MAP.get(
+            event.pop("status", None), AlertStatus.FIRING
+        )
+        # kibana watcher doesn't have severity, so we'll use default (INFO)
+        severity = AlertSeverity.INFO
+
         return AlertDto(
             id=alert_id,
             name=alert_name,
             fingerprint=payload.get("watch_id", alert_id),
             status=status,
+            severity=severity,
             lastReceived=last_received,
             source=["kibana"],
             **event,
         )
 
     @staticmethod
-    def format_alert(event: dict) -> AlertDto | list[AlertDto]:
+    def _format_alert(
+        event: dict, provider_instance: Optional["KibanaProvider"] = None
+    ) -> AlertDto | list[AlertDto]:
         """
         Formats an alert from Kibana to a standard format.
 
@@ -486,6 +508,14 @@ class KibanaProvider(BaseProvider):
             pass
 
         environment = labels.get("environment", "undefined")
+
+        # format status and severity to Keep format
+        event["status"] = KibanaProvider.STATUS_MAP.get(
+            event.get("status"), AlertStatus.FIRING
+        )
+        event["severity"] = KibanaProvider.SEVERITIES_MAP.get(
+            event.get("severity"), AlertSeverity.INFO
+        )
         return AlertDto(
             environment=environment, labels=labels, source=["kibana"], **event
         )

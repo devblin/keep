@@ -6,8 +6,10 @@ import datetime
 import json
 import os
 import time
+from typing import Optional
 
 import pydantic
+import requests
 from datadog_api_client import ApiClient, Configuration
 from datadog_api_client.api_client import Endpoint
 from datadog_api_client.exceptions import (
@@ -25,7 +27,7 @@ from datadog_api_client.v1.model.monitor_options import MonitorOptions
 from datadog_api_client.v1.model.monitor_thresholds import MonitorThresholds
 from datadog_api_client.v1.model.monitor_type import MonitorType
 
-from keep.api.models.alert import AlertDto
+from keep.api.models.alert import AlertDto, AlertSeverity, AlertStatus
 from keep.contextmanager.contextmanager import ContextManager
 from keep.providers.base.base_provider import BaseProvider
 from keep.providers.base.provider_exceptions import GetAlertException
@@ -51,7 +53,8 @@ class DatadogProviderAuthConfig:
             "description": "Datadog Api Key",
             "hint": "https://docs.datadoghq.com/account_management/api-app-keys/#api-keys",
             "sensitive": True,
-        }
+        },
+        default="",
     )
     app_key: str = dataclasses.field(
         metadata={
@@ -59,12 +62,35 @@ class DatadogProviderAuthConfig:
             "description": "Datadog App Key",
             "hint": "https://docs.datadoghq.com/account_management/api-app-keys/#application-keys",
             "sensitive": True,
-        }
+        },
+        default="",
+    )
+    domain: str = dataclasses.field(
+        metadata={
+            "required": False,
+            "description": "Datadog API domain",
+            "sensitive": False,
+            "hint": "https://api.datadoghq.com",
+        },
+        default="https://api.datadoghq.com",
+    )
+    oauth_token: dict = dataclasses.field(
+        metadata={
+            "description": "For OAuth flow",
+            "required": False,
+            "sensitive": True,
+            "hidden": True,
+        },
+        default_factory=dict,
     )
 
 
 class DatadogProvider(BaseProvider):
     """Pull/push alerts from Datadog."""
+
+    OAUTH2_URL = os.environ.get("DATADOG_OAUTH2_URL")
+    DATADOG_CLIENT_ID = os.environ.get("DATADOG_CLIENT_ID")
+    DATADOG_CLIENT_SECRET = os.environ.get("DATADOG_CLIENT_SECRET")
 
     PROVIDER_SCOPES = [
         ProviderScope(
@@ -152,6 +178,19 @@ class DatadogProvider(BaseProvider):
         }
     )
 
+    SEVERITIES_MAP = {
+        "P4": AlertSeverity.INFO,
+        "P3": AlertSeverity.WARNING,
+        "P2": AlertSeverity.HIGH,
+        "P1": AlertSeverity.CRITICAL,
+    }
+
+    STATUS_MAP = {
+        "Triggered": AlertStatus.FIRING,
+        "Recovered": AlertStatus.RESOLVED,
+        "Muted": AlertStatus.SUPPRESSED,
+    }
+
     def convert_to_seconds(s):
         seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
         return int(s[:-1]) * seconds_per_unit[s[-1]]
@@ -161,11 +200,93 @@ class DatadogProvider(BaseProvider):
     ):
         super().__init__(context_manager, provider_id, config)
         self.configuration = Configuration(request_timeout=5)
-        self.configuration.api_key["apiKeyAuth"] = self.authentication_config.api_key
-        self.configuration.api_key["appKeyAuth"] = self.authentication_config.app_key
+        if self.authentication_config.api_key and self.authentication_config.app_key:
+            self.configuration.api_key[
+                "apiKeyAuth"
+            ] = self.authentication_config.api_key
+            self.configuration.api_key[
+                "appKeyAuth"
+            ] = self.authentication_config.app_key
+            domain = self.authentication_config.domain or "https://api.datadoghq.com"
+            self.configuration.host = domain
+        elif self.authentication_config.oauth_token:
+            domain = self.authentication_config.oauth_token.get(
+                "domain", "datadoghq.com"
+            )
+            response = requests.post(
+                f"https://api.{domain}/oauth2/v1/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": DatadogProvider.DATADOG_CLIENT_ID,
+                    "client_secret": DatadogProvider.DATADOG_CLIENT_SECRET,
+                    "redirect_uri": self.authentication_config.oauth_token.get(
+                        "redirect_uri"
+                    ),
+                    "code_verifier": self.authentication_config.oauth_token.get(
+                        "verifier"
+                    ),
+                    "code": self.authentication_config.oauth_token.get("code"),
+                    "refresh_token": self.authentication_config.oauth_token.get(
+                        "refresh_token"
+                    ),
+                },
+            )
+            if not response.ok:
+                raise Exception("Could not refresh token, need to re-authenticate")
+            response_json = response.json()
+            self.configuration.access_token = response_json.get("access_token")
+            self.configuration.host = f"https://api.{domain}"
+            # update the oauth_token refresh_token for next run
+            self.config.authentication["oauth_token"]["refresh_token"] = response_json[
+                "refresh_token"
+            ]
+        else:
+            raise Exception("No authentication provided")
         # to be exposed
         self.to = None
         self._from = None
+
+    @staticmethod
+    def oauth2_logic(**payload) -> dict:
+        """
+        Logic for handling oauth2 callback.
+
+        Returns:
+            dict: access token to Datadog.
+        """
+        domain = payload.pop("domain", "datadoghq.com")
+        verifier = payload.pop("verifier", None)
+        if not verifier:
+            raise Exception("No verifier provided")
+        code = payload.pop("code", None)
+        if not code:
+            raise Exception("No code provided")
+
+        token = requests.post(
+            f"https://api.{domain}/oauth2/v1/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": payload["client_id"],
+                "client_secret": DatadogProvider.DATADOG_CLIENT_SECRET,
+                "redirect_uri": payload["redirect_uri"],
+                "code_verifier": verifier,
+                "code": code,
+            },
+        ).json()
+
+        access_token = token.get("access_token")
+        if not access_token:
+            raise Exception("No access token provided")
+
+        return {
+            "oauth_token": {
+                **token,
+                "verifier": verifier,
+                "code": code,
+                "redirect_uri": payload["redirect_uri"],
+                "domain": domain,
+            }
+        }
 
     def mute_monitor(
         self,
@@ -434,17 +555,6 @@ class DatadogProvider(BaseProvider):
                 )
         return monitors
 
-    @staticmethod
-    def __get_parsed_severity(priority):
-        if priority == "P1":
-            return "critical"
-        elif priority == "P2":
-            return "high"
-        elif priority == "P3":
-            return "medium"
-        elif priority == "P4":
-            return "low"
-
     def _get_alerts(self) -> list[AlertDto]:
         formatted_alerts = []
         with ApiClient(self.configuration) as api_client:
@@ -475,26 +585,38 @@ class DatadogProvider(BaseProvider):
                         )
                     }
                     severity, status, title = event.title.split(" ", 2)
-                    severity = self.__get_parsed_severity(
-                        severity.lstrip("[").rstrip("]")
+                    severity = severity.lstrip("[").rstrip("]")
+                    severity = DatadogProvider.SEVERITIES_MAP.get(
+                        severity, AlertSeverity.INFO
                     )
                     status = status.lstrip("[").rstrip("]")
                     received = datetime.datetime.fromtimestamp(
                         event.get("date_happened")
                     )
                     monitor = all_monitors.get(event.monitor_id)
-                    is_muted = any(
-                        [
-                            downtime
-                            for downtime in monitor.matching_downtimes
-                            if downtime.groups == event.monitor_groups
-                            or downtime.scope == ["*"]
-                        ]
+                    is_muted = (
+                        False
+                        if not monitor
+                        else any(
+                            [
+                                downtime
+                                for downtime in monitor.matching_downtimes
+                                if downtime.groups == event.monitor_groups
+                                or downtime.scope == ["*"]
+                            ]
+                        )
                     )
+
+                    status = (
+                        DatadogProvider.STATUS_MAP.get(status, AlertStatus.FIRING)
+                        if not is_muted
+                        else AlertStatus.SUPPRESSED
+                    )
+
                     alert = AlertDto(
                         id=event.id,
                         name=title,
-                        status=status if not is_muted else "Muted",
+                        status=status,
                         lastReceived=received.isoformat(),
                         severity=severity,
                         message=event.text,
@@ -626,7 +748,10 @@ class DatadogProvider(BaseProvider):
                         )
                 self.logger.info("Monitors updated")
 
-    def format_alert(event: dict) -> AlertDto:
+    @staticmethod
+    def _format_alert(
+        event: dict, provider_instance: Optional["DatadogProvider"] = None
+    ) -> AlertDto:
         tags_list = event.get("tags", "").split(",")
         tags_list.remove("monitor")
         tags = {k: v for k, v in map(lambda tag: tag.split(":"), tags_list)}
@@ -634,8 +759,14 @@ class DatadogProvider(BaseProvider):
             int(event.get("last_updated")) / 1000, tz=datetime.timezone.utc
         )
         title = event.get("title")
-        status = event.get("alert_transition")
-        severity = event.get("severity")
+        # format status and severity to Keep's format
+        status = DatadogProvider.STATUS_MAP.get(
+            event.get("alert_transition"), AlertStatus.FIRING
+        )
+        severity = DatadogProvider.SEVERITIES_MAP.get(
+            event.get("severity"), AlertSeverity.INFO
+        )
+
         url = event.pop("url", None)
 
         # https://docs.datadoghq.com/integrations/webhooks/#variables
@@ -653,7 +784,7 @@ class DatadogProvider(BaseProvider):
             source=["datadog"],
             message=event.get("body"),
             groups=groups,
-            severity=DatadogProvider.__get_parsed_severity(severity),
+            severity=severity,
             url=url,
             tags=tags,
             monitor_id=event.get("monitor_id"),
@@ -688,6 +819,40 @@ class DatadogProvider(BaseProvider):
     @staticmethod
     def get_alert_schema():
         return DatadogAlertFormatDescription.schema()
+
+    @classmethod
+    def simulate_alert(cls) -> dict:
+        # Choose a random alert type
+        import hashlib
+        import random
+
+        from keep.providers.datadog_provider.alerts_mock import ALERTS
+
+        alert_type = random.choice(list(ALERTS.keys()))
+        alert_data = ALERTS[alert_type]
+
+        # Start with the base payload
+        simulated_alert = alert_data["payload"].copy()
+
+        # Apply variability based on parameters
+        for param, choices in alert_data.get("parameters", {}).items():
+            # Split param on '.' for nested parameters (if any)
+            param_parts = param.split(".")
+            target = simulated_alert
+            for part in param_parts[:-1]:
+                target = target.setdefault(part, {})
+
+            # Choose a random value for the parameter
+            target[param_parts[-1]] = random.choice(choices)
+
+        simulated_alert["last_updated"] = int(time.time() * 1000)
+        simulated_alert["alert_transition"] = random.choice(
+            list(DatadogProvider.STATUS_MAP.keys())
+        )
+        simulated_alert["id"] = hashlib.sha256(
+            str(simulated_alert).encode()
+        ).hexdigest()
+        return simulated_alert
 
 
 if __name__ == "__main__":

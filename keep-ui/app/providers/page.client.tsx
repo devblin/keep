@@ -17,15 +17,14 @@ import { LayoutContext } from "./context";
 import { toast } from "react-toastify";
 import { updateIntercom } from "@/components/ui/Intercom";
 import { useRouter } from "next/navigation";
-import { Callout } from "@tremor/react";
 
 export const useFetchProviders = () => {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [installedProviders, setInstalledProviders] = useState<Provider[]>([]);
+  const [linkedProviders, setLinkedProviders] = useState<Provider[]>([]); // Added state for linkedProviders
   const [isSlowLoading, setIsSlowLoading] = useState<boolean>(false);
   const { data: session, status } = useSession();
   let shouldFetch = session?.accessToken ? true : false;
-
 
   const { data, error } = useSWR<ProvidersResponse>(
     shouldFetch ? `${getApiURL()}/providers` : null,
@@ -40,11 +39,12 @@ export const useFetchProviders = () => {
   );
 
   const isLocalhost = data && data.is_localhost;
-  const toastShownKey = 'localhostToastShown';
+  const toastShownKey = "localhostToastShown";
   const ToastMessage = () => (
     <div>
-      Webhooks are disabled because Keep is not accessible from the internet.<br /><br />
-
+      Webhooks are disabled because Keep is not accessible from the internet.
+      <br />
+      <br />
       Click for Keep docs on how to enabled it 📚
     </div>
   );
@@ -53,76 +53,68 @@ export const useFetchProviders = () => {
     const toastShown = localStorage.getItem(toastShownKey);
 
     if (isLocalhost && !toastShown) {
-      toast(<ToastMessage/>, {
+      toast(<ToastMessage />, {
         type: "info",
         position: toast.POSITION.TOP_CENTER,
         autoClose: 10000,
-        onClick: () => window.open('https://docs.keephq.dev/development/external-url', '_blank'),
+        onClick: () =>
+          window.open(
+            "https://docs.keephq.dev/development/external-url",
+            "_blank"
+          ),
         style: {
           width: "250%", // Set width
           marginLeft: "-75%", // Adjust starting position to left
         },
-        progressStyle: { backgroundColor: 'orange' }
+        progressStyle: { backgroundColor: "orange" },
       });
-      localStorage.setItem(toastShownKey, 'true');
+      localStorage.setItem(toastShownKey, "true");
     }
   }, [isLocalhost]);
 
-  // process data here if it's available
-  if (data && providers.length === 0 && installedProviders.length === 0) {
-    // TODO: need to refactor the backend response
-    const fetchedInstalledProviders = data.installed_providers.map(
-      (provider) => {
-        const validatedScopes = provider.validatedScopes ?? {};
-        return {
+  useEffect(() => {
+    if (data && providers.length === 0 && installedProviders.length === 0 && linkedProviders.length === 0) {
+      const fetchedInstalledProviders = data.installed_providers.map(
+        (provider) => ({
           ...provider,
           installed: true,
-          validatedScopes: validatedScopes,
-        } as Provider;
-      }
-    );
-    // TODO: refactor this to be more readable and move to backend(?)
-    const fetchedProviders = data.providers.map((provider: Provider) => {
-      const updatedProvider: Provider = {
-        config: { ...defaultProvider.config, ...(provider as Provider).config },
-        installed: (provider as Provider).installed ?? false,
-        details: {
-          authentication: {
-            ...defaultProvider.details.authentication,
-            ...((provider as Provider).details?.authentication || {}),
-          },
-        },
-        id: provider.type,
-        comingSoon:
-          (provider as Provider).comingSoon || defaultProvider.comingSoon,
-        can_query: false,
-        can_notify: false,
-        type: provider.type,
-        can_setup_webhook: provider.can_setup_webhook,
-        supports_webhook: provider.supports_webhook,
-        provider_description: provider.provider_description,
-        oauth2_url: provider.oauth2_url,
-        scopes: provider.scopes,
-        validatedScopes: provider.validatedScopes,
-        tags: provider.tags,
-      };
-      return updatedProvider;
-    }) as Providers;
+          validatedScopes: provider.validatedScopes ?? {},
+        })
+      );
 
-    setInstalledProviders(fetchedInstalledProviders);
-    setProviders(fetchedProviders);
-  }
+      const fetchedProviders = data.providers.map((provider) => ({
+        ...defaultProvider,
+        ...provider,
+        id: provider.type,
+        installed: provider.installed ?? false,
+      }));
+
+      const fetchedLinkedProviders = data.linked_providers?.map((provider) => ({
+        ...defaultProvider,
+        ...provider,
+        linked: true,
+        validatedScopes: provider.validatedScopes ?? {},
+      }));
+
+      setInstalledProviders(fetchedInstalledProviders);
+      setProviders(fetchedProviders);
+      setLinkedProviders(fetchedLinkedProviders); // Update state with linked providers
+    }
+  }, [data, providers.length, installedProviders.length, linkedProviders?.length]);
+
   return {
     providers,
     installedProviders,
+    linkedProviders, // Include linkedProviders in the returned object
     setInstalledProviders,
     status,
     error,
     session,
     isSlowLoading,
-    isLocalhost
+    isLocalhost,
   };
 };
+
 
 export default function ProvidersPage({
   searchParams,
@@ -132,12 +124,13 @@ export default function ProvidersPage({
   const {
     providers,
     installedProviders,
+    linkedProviders,
     setInstalledProviders,
     status,
     error,
     session,
     isSlowLoading,
-    isLocalhost
+    isLocalhost,
   } = useFetchProviders();
   const { searchProviderString, selectedTags } = useContext(LayoutContext);
   const router = useRouter();
@@ -205,6 +198,15 @@ export default function ProvidersPage({
           addProvider={addProvider}
           onDelete={deleteProvider}
           installedProvidersMode={true}
+        />
+      )}
+      {linkedProviders?.length > 0 && (
+        <ProvidersTiles
+          providers={linkedProviders}
+          addProvider={addProvider}
+          onDelete={deleteProvider}
+          linkedProvidersMode={true}
+          isLocalhost={isLocalhost}
         />
       )}
       <ProvidersTiles

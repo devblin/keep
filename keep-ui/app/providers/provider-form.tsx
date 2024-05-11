@@ -16,7 +16,10 @@ import {
   Divider,
   TextInput,
 } from "@tremor/react";
-import { ExclamationCircleIcon, ExclamationTriangleIcon } from "@heroicons/react/20/solid";
+import {
+  ExclamationCircleIcon,
+  ExclamationTriangleIcon,
+} from "@heroicons/react/20/solid";
 import {
   QuestionMarkCircleIcon,
   ArrowLongRightIcon,
@@ -29,9 +32,10 @@ import {
 import { installWebhook } from "../../utils/helpers";
 import { ProviderSemiAutomated } from "./provider-semi-automated";
 import ProviderFormScopes from "./provider-form-scopes";
-import Link from 'next/link'
-
-
+import Link from "next/link";
+import cookieCutter from "@boiseitguru/cookie-cutter";
+import { useSearchParams } from "next/navigation";
+import "./provider-form.css";
 
 type ProviderFormProps = {
   provider: Provider;
@@ -50,6 +54,33 @@ type ProviderFormProps = {
   isLocalhost?: boolean;
 };
 
+function dec2hex(dec) {
+  return ("0" + dec.toString(16)).substr(-2);
+}
+
+function generateRandomString() {
+  var array = new Uint32Array(56 / 2);
+  window.crypto.getRandomValues(array);
+  return Array.from(array, dec2hex).join("");
+}
+
+function sha256(plain) {
+  // returns promise ArrayBuffer
+  const encoder = new TextEncoder();
+  const data = encoder.encode(plain);
+  return window.crypto.subtle.digest("SHA-256", data);
+}
+
+function base64urlencode(a) {
+  var str = "";
+  var bytes = new Uint8Array(a);
+  var len = bytes.byteLength;
+  for (var i = 0; i < len; i++) {
+    str += String.fromCharCode(bytes[i]);
+  }
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 const ProviderForm = ({
   provider,
   formData,
@@ -63,6 +94,7 @@ const ProviderForm = ({
   isLocalhost,
 }: ProviderFormProps) => {
   console.log("Loading the ProviderForm component");
+  const searchParams = useSearchParams();
   const initialData = {
     provider_id: provider.id, // Include the provider ID in formValues
     ...formData,
@@ -77,7 +109,6 @@ const ProviderForm = ({
   const [inputErrors, setInputErrors] = useState<{ [key: string]: boolean }>(
     {}
   );
-  const [isModalOpen, setIsModalOpen] = useState(false);
   // Related to scopes
   const [providerValidatedScopes, setProviderValidatedScopes] = useState<{
     [key: string]: boolean | string;
@@ -97,6 +128,30 @@ const ProviderForm = ({
     await installWebhook(provider, accessToken!);
     e.preventDefault();
   };
+
+  async function handleOauth(e: MouseEvent) {
+    e.preventDefault();
+    const verifier = generateRandomString();
+    cookieCutter.set("verifier", verifier);
+    const verifierChallenge = base64urlencode(await sha256(verifier));
+
+    let oauth2Url = provider.oauth2_url;
+    if (searchParams?.get("domain")) {
+      // TODO: this is a hack for Datadog OAuth2 since it can be initated from different domains
+      oauth2Url = oauth2Url?.replace(
+        "datadoghq.com",
+        searchParams.get("domain")
+      );
+    }
+
+    let url = `${oauth2Url}&redirect_uri=${window.location.origin}/providers/oauth2/${provider.type}&code_challenge=${verifierChallenge}&code_challenge_method=S256`;
+
+    if (provider.type === "slack") {
+      url += `&state=${verifier}`;
+    }
+
+    window.location.assign(url);
+  }
 
   useEffect(() => {
     if (triggerRevalidateScope !== 0) {
@@ -242,11 +297,14 @@ const ProviderForm = ({
         if (!response.ok) {
           // If the response is not okay, throw the error message
           return response_json.then((errorData) => {
+            if (response.status === 409) {
+              throw `Provider with name ${formValues.provider_name} already exists`;
+            }
             const errorDetail = errorData.detail;
             if (response.status === 412) {
               setProviderValidatedScopes(errorDetail);
             }
-            throw `Scopes are invalid for ${provider.type}: ${JSON.stringify(
+            throw `${provider.type} scopes are invalid: ${JSON.stringify(
               errorDetail,
               null,
               4
@@ -288,7 +346,11 @@ const ProviderForm = ({
           console.log("Connect Result:", data);
           setIsLoading(false);
           onConnectChange(false, true);
-          if (formValues.install_webhook && provider.can_setup_webhook) {
+          if (
+            formValues.install_webhook &&
+            provider.can_setup_webhook &&
+            !isLocalhost
+          ) {
             installWebhook(data as Provider, accessToken);
           }
           onAddProvider({ ...provider, ...data } as Provider);
@@ -312,11 +374,11 @@ const ProviderForm = ({
     <div className="flex flex-col h-full justify-between p-5">
       <div>
         <div className="flex flex-row">
-        <Title>
-          Connect to{" "}
-          {provider.type.charAt(0).toLocaleUpperCase() + provider.type.slice(1)}
-        </Title>
-          <Link href={`http://docs.keephq.dev/providers/documentation/${provider.type}-provider`} target="_blank">
+          <Title>Connect to {provider.display_name}</Title>
+          <Link
+            href={`http://docs.keephq.dev/providers/documentation/${provider.type}-provider`}
+            target="_blank"
+          >
             <Icon
               icon={DocumentTextIcon}
               variant="simple"
@@ -330,36 +392,38 @@ const ProviderForm = ({
         {provider.provider_description && (
           <Subtitle>{provider.provider_description}</Subtitle>
         )}
-        <div className="flex items-center">
-          <Image
-            src={`/keep.png`}
-            width={55}
-            height={64}
-            alt={provider.type}
-            className="mt-5 mb-9 mr-2.5"
-          />
-          <div className="flex flex-col">
-            <Icon
-              icon={ArrowLongLeftIcon}
-              size="xl"
-              color="orange"
-              className="py-0"
+        {Object.keys(provider.config).length > 0 && (
+          <div className="flex items-center">
+            <Image
+              src={`/keep.png`}
+              width={55}
+              height={64}
+              alt={provider.type}
+              className="mt-5 mb-9 mr-2.5"
             />
-            <Icon
-              icon={ArrowLongRightIcon}
-              size="xl"
-              color="orange"
-              className="py-0 pb-2.5"
+            <div className="flex flex-col">
+              <Icon
+                icon={ArrowLongLeftIcon}
+                size="xl"
+                color="orange"
+                className="py-0"
+              />
+              <Icon
+                icon={ArrowLongRightIcon}
+                size="xl"
+                color="orange"
+                className="py-0 pb-2.5"
+              />
+            </div>
+            <Image
+              src={`/icons/${provider.type}-icon.png`}
+              width={64}
+              height={55}
+              alt={provider.type}
+              className="mt-5 mb-9 ml-2.5"
             />
           </div>
-          <Image
-            src={`/icons/${provider.type}-icon.png`}
-            width={64}
-            height={55}
-            alt={provider.type}
-            className="mt-5 mb-9 ml-2.5"
-          />
-        </div>
+        )}
         {provider.scopes?.length > 0 && (
           <ProviderFormScopes
             provider={provider}
@@ -377,41 +441,40 @@ const ProviderForm = ({
                   color="orange"
                   variant="secondary"
                   icon={ArrowTopRightOnSquareIcon}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    window.location.assign(
-                      `${provider.oauth2_url}&redirect_uri=${window.location.origin}/providers/oauth2/${provider.type}`
-                    );
-                  }}
+                  onClick={handleOauth}
                 >
                   Install with OAuth2
                 </Button>
                 <Divider />
               </>
             ) : null}
-            <label htmlFor="provider_name" className="label-container mb-1">
-              <Text>
-                Provider Name
-                <span className="text-red-400">*</span>
-              </Text>
-            </label>
-            <TextInput
-              type="text"
-              id="provider_name"
-              name="provider_name"
-              value={formValues.provider_name || ""}
-              onChange={handleInputChange}
-              placeholder="Enter provider name"
-              color="orange"
-              autoComplete="off"
-              disabled={isProviderNameDisabled}
-              error={Object.keys(inputErrors).includes("provider_name")}
-              title={
-                isProviderNameDisabled
-                  ? "This field is disabled because it is pre-filled from the workflow."
-                  : ""
-              }
-            />
+            {Object.keys(provider.config).length > 0 && (
+              <>
+                <label htmlFor="provider_name" className="label-container mb-1">
+                  <Text>
+                    Provider Name
+                    <span className="text-red-400">*</span>
+                  </Text>
+                </label>
+                <TextInput
+                  type="text"
+                  id="provider_name"
+                  name="provider_name"
+                  value={formValues.provider_name || ""}
+                  onChange={handleInputChange}
+                  placeholder="Enter provider name"
+                  color="orange"
+                  autoComplete="off"
+                  disabled={isProviderNameDisabled}
+                  error={Object.keys(inputErrors).includes("provider_name")}
+                  title={
+                    isProviderNameDisabled
+                      ? "This field is disabled because it is pre-filled from the workflow."
+                      : ""
+                  }
+                />
+              </>
+            )}
           </div>
           {Object.keys(provider.config).map((configKey) => {
             const method = provider.config[configKey];
@@ -486,7 +549,7 @@ const ProviderForm = ({
           })}
           <div className="w-full mt-2" key="install_webhook">
             {provider.can_setup_webhook && !installedProvidersMode && (
-              <div className={`${isLocalhost ? 'bg-gray-100 p-2' : ''}`}>
+              <div className={`${isLocalhost ? "bg-gray-100 p-2" : ""}`}>
                 <div className="flex items-center">
                   <input
                     type="checkbox"
@@ -494,10 +557,15 @@ const ProviderForm = ({
                     name="install_webhook"
                     className="mr-2.5"
                     onChange={handleWebhookChange}
-                    checked={(formValues["install_webhook"] || false) && !isLocalhost}
+                    checked={
+                      (formValues["install_webhook"] || false) && !isLocalhost
+                    }
                     disabled={isLocalhost}
                   />
-                  <label htmlFor="install_webhook" className="flex items-center">
+                  <label
+                    htmlFor="install_webhook"
+                    className="flex items-center"
+                  >
                     <Text className="capitalize">Install Webhook</Text>
                     <Icon
                       icon={QuestionMarkCircleIcon}
@@ -510,13 +578,22 @@ const ProviderForm = ({
                 </div>
                 {isLocalhost && (
                   <span className="text-sm">
-                    <Callout className="mt-4" icon={ExclamationTriangleIcon} color="gray">
-                        <a href="https://docs.keephq.dev/development/external-url" target="_blank" rel="noopener noreferrer">
-                        Webhook installation is disabled because Keep is running without an external URL.
-                        <br/><br/>
+                    <Callout
+                      className="mt-4"
+                      icon={ExclamationTriangleIcon}
+                      color="gray"
+                    >
+                      <a
+                        href="https://docs.keephq.dev/development/external-url"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Webhook installation is disabled because Keep is running
+                        without an external URL.
+                        <br />
+                        <br />
                         Click to learn more
-                        </a>
-
+                      </a>
                     </Callout>
                   </span>
                 )}
@@ -572,7 +649,7 @@ const ProviderForm = ({
         >
           Cancel
         </Button>
-        {installedProvidersMode && (
+        {installedProvidersMode && Object.keys(provider.config).length > 0 && (
           <>
             <Button onClick={deleteProvider} color="red" className="mr-2.5">
               Delete
@@ -586,7 +663,7 @@ const ProviderForm = ({
             </Button>
           </>
         )}
-        {!installedProvidersMode && (
+        {!installedProvidersMode && Object.keys(provider.config).length > 0 && (
           <Button
             loading={isLoading}
             onClick={handleConnectClick}

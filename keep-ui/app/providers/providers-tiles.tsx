@@ -1,5 +1,5 @@
 "use client";
-import { Title } from "@tremor/react";
+import { Icon, Title } from "@tremor/react";
 import { Providers, Provider } from "./providers";
 import { useEffect, useState } from "react";
 import SlidingPanel from "react-sliding-side-panel";
@@ -8,18 +8,21 @@ import ProviderTile from "./provider-tile";
 import "react-sliding-side-panel/lib/index.css";
 import { useSearchParams } from "next/navigation";
 import { hideOrShowIntercom } from "@/components/ui/Intercom";
+import { QuestionMarkCircleIcon } from "@heroicons/react/24/outline";
 
 const ProvidersTiles = ({
   providers,
   addProvider,
   onDelete,
   installedProvidersMode = false,
+  linkedProvidersMode = false,
   isLocalhost = false,
 }: {
   providers: Providers;
   addProvider: (provider: Provider) => void;
   onDelete: (provider: Provider) => void;
   installedProvidersMode?: boolean;
+  linkedProvidersMode?: boolean;
   isLocalhost?: boolean;
 }) => {
   const searchParams = useSearchParams();
@@ -35,7 +38,7 @@ const ProvidersTiles = ({
   const providerName = searchParams?.get("provider_name");
 
   useEffect(() => {
-    if (providerType && providerName) {
+    if (providerType) {
       // Find the provider based on providerType and providerName
       const provider = providers.find(
         (provider) => provider.type === providerType
@@ -43,9 +46,11 @@ const ProvidersTiles = ({
 
       if (provider) {
         setSelectedProvider(provider);
-        setFormValues({
-          provider_name: providerName,
-        });
+        if (providerName) {
+          setFormValues({
+            provider_name: providerName,
+          });
+        }
         setOpenPanel(true);
       }
     }
@@ -70,6 +75,9 @@ const ProvidersTiles = ({
   };
 
   const handleConnectProvider = (provider: Provider) => {
+    // on linked providers, don't open the modal
+    if(provider.linked) return;
+
     hideOrShowIntercom(true);
     setSelectedProvider(provider);
     if (installedProvidersMode) {
@@ -96,7 +104,8 @@ const ProvidersTiles = ({
   const providersWithConfig = providers
     .filter((provider) => {
       const config = (provider as Provider).config;
-      return config && Object.keys(config).length > 0; // Filter out providers with empty config
+       // Filter out providers with empty config and providers that support webhooks
+      return (config && Object.keys(config).length > 0) || (provider.supports_webhook);
     })
     .sort(
       (a, b) =>
@@ -108,11 +117,24 @@ const ProvidersTiles = ({
 
   return (
     <div>
-      <Title className="mb-2.5">
-        {installedProvidersMode ? "Installed Providers" : "Available Providers"}
-      </Title>
+      <div className="flex items-center mb-2.5">
+  <Title>
+    {installedProvidersMode ? "Installed Providers" : linkedProvidersMode ? "Linked Providers" : "Available Providers"}
+  </Title>
+  {linkedProvidersMode && (
+    <div className="ml-2 relative">
+      <Icon
+        icon={QuestionMarkCircleIcon} // Use the appropriate icon for your use case
+        className="text-gray-400 hover:text-gray-600"
+        size="sm"
+        tooltip="Providers which send alerts without being installed by Keep"
+      />
+    </div>
+  )}
+</div>
+
       <div className="flex flex-wrap mb-5 gap-5">
-        {providersWithConfig.map((provider, index) => (
+        {providers.map((provider, index) => (
           <ProviderTile
             key={provider.id}
             provider={provider}
@@ -120,6 +142,7 @@ const ProvidersTiles = ({
           ></ProviderTile>
         ))}
       </div>
+
       <SlidingPanel
         type={"right"}
         isOpen={openPanel}
